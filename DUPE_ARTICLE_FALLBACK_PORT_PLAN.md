@@ -40,6 +40,50 @@ coupling a high-value article fallback to approximately 17,000 lines of
 archive, crypto, persistence, concurrency, API, and UI work in the current
 upstream PR.
 
+### Proposed feature flags and Arr compatibility
+
+Use two independent settings, both disabled by default:
+
+```toml
+# Use matching queue/history NZBs as donors for the active target.
+dupe_article_fallback = "off" # off | article | stream | live
+
+# When a later matching NZB arrives, allow one bounded retry attempt derived
+# from an earlier failed NZB. This changes the external queue contract.
+retry_original_nzb = false
+```
+
+`dupe_article_fallback` controls recovery of the currently active target. It
+never, by itself, reopens a terminal history item. `retry_original_nzb` is a
+separate policy because it can create a later attempt after an Arr client has
+already received failure and submitted a replacement.
+
+With only donor fallback enabled, the Arr-safe flow is:
+
+```text
+NZB A fails and remains a terminal history item
+NZB B arrives later with the same duplicate identity
+NZB B may use retained A data as a donor
+NZB B is the only active target and owns its completion/failure event
+```
+
+With `retry_original_nzb=true`, do not silently mutate or resume A. Model the
+retry explicitly:
+
+```text
+original job A (immutable terminal failure)
+  └── retry attempt A#2 (new attempt ID, same client correlation ID)
+       └── donor: later matching NZB B
+```
+
+The opt-in retry policy must define a maximum retry count (default one), an age
+window, eligible failure statuses, cancellation/blacklist behavior, whether B
+also downloads independently, output-collision prevention, and Arr-facing API
+event semantics. Cancelled, deleted, or manually blacklisted jobs must never be
+retried. Until this state machine and its Arr integration tests exist, the
+second flag must remain disabled/experimental or return a clear unsupported
+configuration error.
+
 ## Upstream feature review
 
 ### What the pull request currently contains
@@ -203,6 +247,13 @@ an `NzbCleanupDisk=no`-style operational requirement.
 12. **Recovery metrics do not exist.** Queue/history models, DB rows, API types,
     SAB compatibility fields, Angular models, and detail views need explicit
     recovered and unresolved damage data.
+13. **Late donor arrival must not implicitly resurrect terminal jobs.** A later
+    replacement job may use an earlier failed job as a donor, but reopening the
+    original requires the separate `retry_original_nzb` state machine.
+14. **Original-NZB retry needs attempt identity.** The opt-in flag requires new
+    attempt IDs, client correlation, cancellation/blacklist handling, bounded
+    retries, output de-duplication, and explicit API/history representation. It
+    cannot be implemented by calling `resume_job` on a history item.
 
 ## Target architecture
 
@@ -323,6 +374,9 @@ Tasks:
 - Add DB/catalog queries that return queue and history candidates ordered by
   score and stable insertion/completion order. Include retained NZB bytes and
   password only when the caller is authorized to use them internally.
+- Treat donor lookup as read-only from the active target. With
+  `retry_original_nzb=false`, a failed history row may donate but must never be
+  enqueued, resumed, or mutated because a matching job arrived.
 - Parse donor NZBs outside the queue/jobs and DB locks. Cache immutable
   `Arc<ParsedDonor>` entries in a bounded cache keyed by job ID plus NZB hash.
   Never retain borrowed pointers/references across eviction.
@@ -330,6 +384,8 @@ Tasks:
   history deletion/pruning, retry, and queue removal.
 - Add a read-only diagnostic endpoint or debug log that explains why a donor
   matched or was rejected; do not expose NZB passwords or message-id lists.
+- Add `retry_original_nzb` as an independent persisted setting that defaults to
+  false. Do not perform retry actions until Milestone 3a is implemented.
 
 Likely files:
 
@@ -356,8 +412,9 @@ optimization yet.
 Tasks:
 
 - Add `dupe_article_fallback = "off" | "article"` to `GeneralConfig`, its
-  example TOML, config API, and settings UI. Parse future enum values but reject
-  activation with a clear unsupported-mode error until their milestone lands.
+  example TOML, config API, and settings UI, plus the independent boolean
+  `retry_original_nzb = false`. Parse future enum values but reject activation
+  with a clear unsupported-mode error until their milestone lands.
 - Introduce an `ArticleSource` value containing message-id, primary/donor job
   ID, source kind, and expected donor file/segment identity.
 - Extend each work item with its immutable primary source, a pinned fallback
@@ -410,12 +467,19 @@ Exit criteria:
 
 - Two structurally equivalent NZBs with complementary holes produce a
   byte-identical output and zero unresolved failures.
+- In an Arr-shaped integration test, A emits a terminal failure, then B arrives
+  and may borrow retained A data while A remains terminal and emits no retry or
+  later completion event when `retry_original_nzb=false`.
 - Without the donor, the same primary follows the existing failure/PAR2 path.
 - Wrong file size, shifted part boundary, ambiguous file, wrong part number,
   local I/O failure, provider outage, deletion, and restart cases fail closed.
 - A fallback round does not alter terminal failure or hopeless counters until
   every pinned source is exhausted.
 - `off` is behaviorally identical to the pre-feature baseline.
+
+Enabling only `dupe_article_fallback` must never reopen a terminal history job.
+Before Milestone 3a exists, setting `retry_original_nzb=true` must be rejected
+or be an explicitly documented no-op rather than silently approximated.
 
 ### Milestone 3: article cutover and lead rotation
 
@@ -449,6 +513,43 @@ Exit criteria:
 - Candidate insertion/removal and stale in-flight results cannot skip, repeat,
   or misattribute a source.
 - Recovered counts remain bounded by primary holes under timing variation.
+
+### Milestone 3a: opt-in retry of original NZBs
+
+**Goal:** when a later matching NZB arrives, optionally create one bounded
+retry attempt derived from an earlier failed original without rewriting the
+original terminal event.
+
+This milestone is separate from donor fallback and remains disabled by
+default. It should not be started solely because the article layer works.
+
+Tasks:
+
+- Add a `RetryAttempt` model with original job ID, new attempt ID, duplicate
+  identity, client correlation ID, donor job ID, creation time, retry count,
+  and cancellation/blacklist state.
+- Add an eligibility query for recent failed/incomplete history rows. Exclude
+  cancelled, deleted, manually blacklisted, already retried, and expired rows.
+- Create a new A#2 attempt instead of changing A's history row or calling
+  `resume_job` on it. A remains an immutable failed history event.
+- Pin the later NZB's donor data before it can be removed. Define whether B is
+  donor-only or also an active independent target; do not accidentally run two
+  copies with the same output destination.
+- Define output collision behavior, final history presentation, API event
+  ordering, and Arr correlation before enabling the flag.
+- Handle cancellation before matching, after queueing, during donor fetch, and
+  after partial output. Cancellation must suppress a late completion event.
+- Default to one retry within a bounded age window and emit telemetry for
+  accepted, suppressed, cancelled, completed, and failed retry attempts.
+
+Exit criteria:
+
+- With the flag off, failed A remains terminal when B arrives.
+- With the flag on, A stays immutable and A#2 is a distinct bounded attempt
+  with deterministic API/history semantics.
+- Arr integration tests cover failure notification, replacement submission,
+  blacklist/cancel, successful and failed retry, output collision, and restart
+  between matching and retry.
 
 ### Milestone 4: restart-safe hole ledger and standalone donor fetch
 
@@ -685,7 +786,8 @@ Tasks:
   NZB behavior, failure limits, resource cost, and the default-off posture.
 - Document interaction with hopeless abort, required completion, PAR2,
   post-processing level 0, direct unpack, deletion, history retention, server
-  reconfiguration, DAV, and archive passwords.
+  reconfiguration, DAV, archive passwords, Arr terminal events,
+  `dupe_article_fallback`, and `retry_original_nzb`.
 - Add OTEL counters/histograms for donor matches/rejections, fallback attempts,
   recovered units, verification failures, repair duration, fetched donor bytes,
   cache behavior, cap hits, and cancellations. Keep identifiers low-cardinality.
@@ -737,6 +839,16 @@ Every positive scenario must assert final bytes, status, recovery metrics, and
 absence of residual temp files. Every negative scenario must assert unchanged
 known-good target regions and no false success, not merely a log line.
 
+Add an Arr contract scenario: submit A, wait for its terminal failure, submit B
+with the same duplicate identity, assert B can use A as a donor, and assert A
+never re-enters `Queued`/`Downloading` or emits a second terminal event while
+`retry_original_nzb=false`.
+
+When late retry is implemented, add the opt-in inverse: A remains an immutable
+failed history event, A#2 has a distinct attempt record, cancellation suppresses
+late completion, and output/API events cannot be mistaken for two independent
+successful downloads.
+
 ### CI and hardening
 
 - Run the article and M1 functional smoke matrix on every pull request.
@@ -761,6 +873,8 @@ known-good target regions and no false success, not merely a log line.
    cap resource use conservatively.
 6. Enable `live` last, initially experimental, because it adds lifecycle risk
    but no new recovery capability over post-download stream repair.
+7. Enable `retry_original_nzb` separately after Arr contract tests pass. Its
+   rollout and rollback must not change ordinary donor fallback behavior.
 
 SQLite migrations should be additive. On rollback, old rustnzbd releases may
 ignore added columns/tables but must retain queue/history core rows. Test an
@@ -772,9 +886,14 @@ line.
 
 The complete port is done only when:
 
-- all four configuration surfaces behave as documented and default to off;
+- `dupe_article_fallback` and `retry_original_nzb` behave as documented and
+  both default to off;
 - duplicate discovery works across queue and retained history NZBs without an
   external file-retention setting;
+- donor fallback alone never resurrects a job that already emitted terminal
+  failure;
+- an enabled original-NZB retry creates a bounded, explicit retry attempt
+  rather than mutating or silently reopening the original history item;
 - article fallback never charges a terminal failure while a pinned source
   remains;
 - every donor write is geometry-valid and, for stream modes, content-proven;
@@ -800,7 +919,8 @@ The complete port is done only when:
 9. `feat(recovery): add password-assisted store-rar repair`
 10. `feat(recovery): add bounded decompression donor mode`
 11. `feat(recovery): add live repair lifecycle`
-12. `feat(ui): expose duplicate recovery settings and statistics`
+12. `feat(recovery): add opt-in original-NZB retry state machine`
+13. `feat(ui): expose duplicate recovery settings and statistics`
 
 Each PR should include its own migration, tests, documentation, and disabled or
 fully usable product surface. Avoid merging scaffolding that changes runtime

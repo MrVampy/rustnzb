@@ -8,6 +8,11 @@
 - Review date: 2026-07-21
 - Target repository revision: rustnzbd `main` at `4f89fc8`
 - Scope of this document: design and implementation plan only; no feature code is included
+- Blocking prerequisite: [`DOWNLOAD_ENGINE_CONSOLIDATION_GATE.md`](DOWNLOAD_ENGINE_CONSOLIDATION_GATE.md)
+
+This feature plan is blocked. Do not begin implementation until the separate
+download-engine consolidation gate is complete. That gate is existing
+architecture work, not a milestone or deliverable of this feature.
 
 ## Executive recommendation
 
@@ -29,7 +34,8 @@ adds a useful recovery ladder:
 
 The appropriate rustnzbd delivery strategy is:
 
-- land duplicate identity, donor indexing, and dispatch ownership first;
+- complete the separate download-engine consolidation gate;
+- land duplicate identity and donor indexing after the gate passes;
 - ship a fail-closed `article` implementation next;
 - add same-byte `stream` repair only after restart-safe hole tracking exists;
 - treat cross-packing, encryption, decompression, and `live` as separate
@@ -211,12 +217,10 @@ an `NzbCleanupDisk=no`-style operational requirement.
    selection.
 2. **No donor index.** Queue and history have no query that returns compatible
    donor metadata plus retained NZB data in score order.
-3. **Two download-engine implementations have diverged.** The active
-   `QueueManager` imports `crate::download_engine` from `nzb-web`, while
-   `nzb-dispatch` contains another `download_engine.rs` and a `DispatchEngine`
-   boundary. They are not identical. Adding fallback to both would compound
-   drift; adding it to only one would make the nominal shared dispatcher lie
-   about behavior.
+3. **The blocking dispatch-ownership gate is unresolved.** The duplicate
+   engines and their migration are intentionally out of scope here. Complete
+   [`DOWNLOAD_ENGINE_CONSOLIDATION_GATE.md`](DOWNLOAD_ENGINE_CONSOLIDATION_GATE.md)
+   before acting on any milestone below.
 4. **Work items have one source.** `WorkItem` stores a single `message_id` and
    provider outcomes, but no primary identity, pinned donor list, source round,
    reactive/proactive marker, or donor job identity.
@@ -318,40 +322,20 @@ normalized-title fallback, and expose the selected identity in debug logs.
 
 ## Implementation milestones
 
-### Milestone 0: freeze the behavior and choose dispatch ownership
+### Entry gate: confirm the prerequisite is complete
 
-**Goal:** eliminate ambiguity before feature code changes the download path.
+Before starting Milestone 1:
 
-Tasks:
+- verify every definition-of-done item in
+  [`DOWNLOAD_ENGINE_CONSOLIDATION_GATE.md`](DOWNLOAD_ENGINE_CONSOLIDATION_GATE.md);
+- record the merged gate commit in this document's status block;
+- re-check PR #850 at its final/selected revision; and
+- capture the feature behavior matrix for modes, source order, structural
+  gates, accounting, restart, and negative cases.
 
-- Re-check PR #850 at its final/selected revision and capture a small behavior
-  matrix in tests: modes, source order, structural gates, accounting, restart,
-  and negative cases.
-- Decide that `nzb-dispatch` is the authoritative implementation, then migrate
-  `nzb-web::QueueManager` to its `DispatchEngine`; alternatively document and
-  complete removal of `nzb-dispatch`. Do not keep two fallback implementations.
-- Extend the dispatch trait only with queue-independent concepts: job
-  submission, source retry, bounded standalone fetch, pause/cancel, and typed
-  progress. Donor discovery remains above the dispatch layer.
-- Add contract tests that run the chosen dispatcher through the queue manager,
-  including pause/resume, restart, typed provider errors, and terminal event
-  ownership.
-- Document the clean-room implementation rule for GPL-derived behavior.
-
-Likely files:
-
-- `crates/nzb-dispatch/src/dispatch_engine.rs`
-- `crates/nzb-dispatch/src/download_engine.rs`
-- `crates/nzb-web/src/download_engine.rs`
-- `crates/nzb-web/src/queue_manager.rs`
-- `crates/nzb-web/Cargo.toml`
-
-Exit criteria:
-
-- Only one production article-dispatch implementation is compiled and used.
-- Existing queue, retry, pause, hopeless, and resume suites pass through that
-  implementation.
-- No duplicate-fallback behavior is enabled yet.
+The entry gate adds no dispatch refactoring to this feature plan. If the
+prerequisite is incomplete or has regressed, stop and fix it under the separate
+gate before continuing.
 
 ### Milestone 1: duplicate identity and donor catalog
 
@@ -908,19 +892,24 @@ The complete port is done only when:
 
 ## Suggested pull-request sequence
 
-1. `refactor(dispatch): make nzb-dispatch the sole production dispatcher`
-2. `feat(dupes): add duplicate identity and donor catalog`
-3. `feat(recovery): add reactive duplicate article fallback`
-4. `feat(recovery): validate and persist decoded segment geometry`
-5. `feat(recovery): add article cutover and lead rotation`
-6. `feat(recovery): add persisted hole ledger and bounded donor fetcher`
-7. `feat(recovery): add same-byte post-download stream repair`
-8. `feat(recovery): add store/copy content maps`
-9. `feat(recovery): add password-assisted store-rar repair`
-10. `feat(recovery): add bounded decompression donor mode`
-11. `feat(recovery): add live repair lifecycle`
-12. `feat(recovery): add opt-in original-NZB retry state machine`
-13. `feat(ui): expose duplicate recovery settings and statistics`
+Prerequisite, tracked outside this sequence:
+
+- complete [`DOWNLOAD_ENGINE_CONSOLIDATION_GATE.md`](DOWNLOAD_ENGINE_CONSOLIDATION_GATE.md)
+
+Feature sequence after the gate passes:
+
+1. `feat(dupes): add duplicate identity and donor catalog`
+2. `feat(recovery): add reactive duplicate article fallback`
+3. `feat(recovery): validate and persist decoded segment geometry`
+4. `feat(recovery): add article cutover and lead rotation`
+5. `feat(recovery): add persisted hole ledger and bounded donor fetcher`
+6. `feat(recovery): add same-byte post-download stream repair`
+7. `feat(recovery): add store/copy content maps`
+8. `feat(recovery): add password-assisted store-rar repair`
+9. `feat(recovery): add bounded decompression donor mode`
+10. `feat(recovery): add live repair lifecycle`
+11. `feat(recovery): add opt-in original-NZB retry state machine`
+12. `feat(ui): expose duplicate recovery settings and statistics`
 
 Each PR should include its own migration, tests, documentation, and disabled or
 fully usable product surface. Avoid merging scaffolding that changes runtime

@@ -729,7 +729,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -933,9 +933,9 @@ dependencies = [
 
 [[package]]
 name = "futures-io"
-version = "0.3.32"
+version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
+checksum = "4577ecaa3c4f96589d473f679a71b596316f6641bc350038b962a5daf0085d7a"
 
 [[package]]
 name = "futures-macro"
@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "mock-nntp-server"
-version = "1.3.5"
+version = "1.3.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -1877,8 +1877,8 @@ dependencies = [
  "governor",
  "nzb-core",
  "nzb-decode",
- "nzb-news",
  "nzb-nntp",
+ "opentelemetry",
  "parking_lot",
  "serde",
  "serial_test",
@@ -1990,9 +1990,9 @@ dependencies = [
 
 [[package]]
 name = "nzbdav-core"
-version = "0.4.1"
-source = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"
-checksum = "b78de0e6a22cc7d42030b234d55d8de82fae66355b6ad6eef30db435190a288f"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2453cf239678816d1cc21616dca288854045a965e4e3c3a33c5c64851ccbeb64"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2013,9 +2013,9 @@ dependencies = [
 
 [[package]]
 name = "nzbdav-dav"
-version = "0.4.1"
-source = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"
-checksum = "73a1534d092ef82f455a5822c1d8676815bd65287226f90c1e9ee1fbafe58f05"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b47059c533c22cba67e37f97564830da43dc6b59334a26c1bf962c28a1caa11f"
 dependencies = [
  "axum 0.8.9",
  "bincode",
@@ -2037,9 +2037,9 @@ dependencies = [
 
 [[package]]
 name = "nzbdav-pipeline"
-version = "0.4.1"
-source = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"
-checksum = "4bebc904b75cb6dfe0c08679f8884a585797066795f5572258c15e642c19b709"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c403b56d2b522390836abe1b298d4ac2c034c9c08b5c5f9cd1e22bba223515"
 dependencies = [
  "bincode",
  "chrono",
@@ -2060,9 +2060,9 @@ dependencies = [
 
 [[package]]
 name = "nzbdav-rar"
-version = "0.4.1"
-source = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"
-checksum = "3ca35f912dc719c8570e164f35c0fb8c625f5497121bcbf4dee429896818e6a8"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2165afc14786dce9d542f10b44d7925747d74d84bc5cf733be7d0a1ff6392add"
 dependencies = [
  "aes 0.8.4",
  "cbc",
@@ -2076,9 +2076,9 @@ dependencies = [
 
 [[package]]
 name = "nzbdav-stream"
-version = "0.4.1"
-source = "sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/"
-checksum = "eebfb27f7dd8c48884399eb1ce56bb6893560f435fdec23a54633eb5718929a4"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c25fce6056947329affc5e3147970efd90ad31919c3bf7ee333d264b457fa2b3"
 dependencies = [
  "aes 0.8.4",
  "arc-swap",
@@ -2849,7 +2849,7 @@ dependencies = [
 
 [[package]]
 name = "rustnzb"
-version = "1.3.5"
+version = "1.3.6"
 dependencies = [
  "anyhow",
  "arc-swap",

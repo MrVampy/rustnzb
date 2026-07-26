@@ -12,10 +12,9 @@ Confirmed and addressed in the reliability change set:
   history row is durably present. Completed jobs remove their work directory
   only after it is empty; a failed output move retains files for safety.
 
-Open benchmark-led work is tracked in GitHub issues #21–#24. Their vendor
-measurements are hypotheses until reproduced with controlled, legal fixtures.
-Recursive nested archive extraction is tracked in #22; it is not claimed as
-implemented by this status note.
+Open benchmark-led work is tracked in GitHub issues #21, #23, and #24. Their
+vendor measurements are hypotheses until reproduced with controlled, legal
+fixtures.
 
 ## Nested archive extraction — 2026-07-26
 
@@ -27,6 +26,21 @@ post-processing failure and is retained for safety rather than being reported
 as a complete usable payload. Deterministic nested-ZIP tests cover successful
 recursive extraction, direct-unpack output, safe depth-limit failure, cleanup,
 and preserving unrelated completed-directory archives.
+
+## Usable-output completion contract — 2026-07-26
+
+Jobs that reach post-processing but contain only raw archive and PAR2
+artifacts are now recorded as Failed with an explicit `Output` stage rather
+than being moved into the completed library. Paired tests cover the negative
+raw-artifact case and the positive usable-payload case.
+
+## Public WebDAV dependency chain — 2026-07-26
+
+The optional WebDAV feature now resolves `nzbdav-core`, `nzbdav-stream`,
+`nzbdav-pipeline`, and `nzbdav-dav` from public crates.io release `0.5.7`.
+Their public source is https://github.com/TheDancingDeveloper-org/nzbdav-rs;
+the release declares Rust 1.88 compatibility. `cargo check` and the complete
+rustnzb WebDAV feature test suite pass against the public dependency chain.
 
 Historical Node B incomplete-download directories are intentionally not
 deleted by this change. They require a separately approved operator cleanup

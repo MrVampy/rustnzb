@@ -19,7 +19,43 @@ task_start() {
     command -v node >/dev/null 2>&1 && node --version
     command -v npm >/dev/null 2>&1 && npm --version
     command -v sccache >/dev/null 2>&1 && sccache --version
+    wait_for_sccache
     return 0
+}
+
+# The shared Redis backend can still be loading its dataset when a runner
+# starts.  sccache fails during server startup in that window, before Cargo
+# has a chance to run.  Give Redis a bounded amount of time to become usable;
+# cache availability must never determine whether validation runs.
+wait_for_sccache() {
+    [ -n "${RUSTC_WRAPPER:-}" ] || return 0
+    [ "${SCCACHE_DISABLE:-false}" = true ] && return 0
+    command -v sccache >/dev/null 2>&1 || return 0
+
+    attempts=${SCCACHE_REDIS_READY_ATTEMPTS:-15}
+    delay=${SCCACHE_REDIS_READY_DELAY_SECS:-2}
+    case "$attempts" in
+        ''|*[!0-9]*|0) attempts=15 ;;
+    esac
+    case "$delay" in
+        ''|*[!0-9]*) delay=2 ;;
+    esac
+
+    attempt=1
+    while [ "$attempt" -le "$attempts" ]; do
+        if sccache --show-stats >/dev/null 2>&1; then
+            return 0
+        fi
+        if [ "$attempt" -lt "$attempts" ]; then
+            printf 'sccache cache backend is not ready (attempt %s/%s); retrying in %ss\n' \
+                "$attempt" "$attempts" "$delay" >&2
+            sleep "$delay"
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    printf 'sccache cache backend did not become ready; continuing with caching disabled\n' >&2
+    export SCCACHE_DISABLE=true
 }
 
 task_target_dir() {

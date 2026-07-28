@@ -29,7 +29,6 @@ task_start() {
 # cache availability must never determine whether validation runs.
 wait_for_sccache() {
     [ -n "${RUSTC_WRAPPER:-}" ] || return 0
-    [ "${SCCACHE_DISABLE:-false}" = true ] && return 0
     command -v sccache >/dev/null 2>&1 || return 0
 
     attempts=${SCCACHE_REDIS_READY_ATTEMPTS:-15}
@@ -57,8 +56,8 @@ wait_for_sccache() {
         attempt=$((attempt + 1))
     done
 
-    printf 'sccache cache backend did not become ready; continuing with caching disabled\n' >&2
-    export SCCACHE_DISABLE=true
+    printf 'sccache cache backend did not become ready; continuing without sccache\n' >&2
+    unset RUSTC_WRAPPER
 }
 
 task_target_dir() {

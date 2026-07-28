@@ -43,7 +43,10 @@ wait_for_sccache() {
 
     attempt=1
     while [ "$attempt" -le "$attempts" ]; do
-        if sccache --show-stats >/dev/null 2>&1; then
+        # --show-stats can succeed without starting the cache server, even
+        # while Redis is returning BusyLoadingError.  Start the server itself
+        # so this probe exercises the exact path Cargo/rustc will use.
+        if sccache --start-server >/dev/null 2>&1; then
             return 0
         fi
         if [ "$attempt" -lt "$attempts" ]; then

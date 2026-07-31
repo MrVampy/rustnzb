@@ -11,6 +11,7 @@ use crate::auth::{CredentialStore, TokenStore};
 use crate::log_buffer::LogBuffer;
 use crate::queue_manager::QueueManager;
 use crate::state::AppState;
+use nzb_postproc::PostProcLimits;
 
 fn sanitize_loaded_config(config: &mut AppConfig) {
     for server in &mut config.servers {
@@ -133,13 +134,18 @@ pub async fn initialize(
     let log_buffer = log_buffer.unwrap_or_default();
 
     // Create the queue manager
-    let queue_manager = QueueManager::new(
+    let queue_manager = QueueManager::new_with_postproc_limits(
         config.servers.clone(),
         db,
         config.general.incomplete_dir.clone(),
         config.general.complete_dir.clone(),
         log_buffer.clone(),
         config.general.max_active_downloads,
+        PostProcLimits {
+            pipelines: config.general.max_post_processing_jobs,
+            repair: config.general.max_repair_workers,
+            extract: config.general.max_extract_workers,
+        },
         config.categories.clone(),
         config.general.min_free_space_bytes,
         config.general.speed_limit_bps,

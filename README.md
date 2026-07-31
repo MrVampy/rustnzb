@@ -32,6 +32,7 @@ More at [rustnzb.dev](https://rustnzb.dev/) · [GitHub Releases](https://github.
 | **yEnc decoding** | SIMD-accelerated yEnc decoder with CRC32 validation, streamed straight into the file assembler. |
 | **PAR2 verify & repair** | Automatic verification after download. Damaged files are rebuilt from recovery blocks in pure Rust — no external par2 binary. |
 | **Archive extraction** | Automatic extraction of RAR, 7z, and ZIP archives after repair, multi-part sets included, with cleanup. |
+| **Overlapped pipeline** | Independent downloads, PAR2 repair, and extraction can progress together under explicit per-stage worker limits. |
 | **Web UI** | Queue, history with per-download insights, lifetime statistics, live logs, drag-and-drop NZB upload, and selectable themes. |
 | **Automation** | RSS feeds with regex rules, a watch folder, and a newsgroup browser with header search and threaded views. |
 | **Media library** | WebDAV library that streams files on demand, straight from Usenet, without downloading first. |
@@ -137,10 +138,19 @@ Parse NZB
   -> nzb-news
   -> Download (nzb-nntp pipelining, multi-server failover)
   -> Decode (yEnc + CRC32)
-  -> Verify & Repair (PAR2)
-  -> Extract (RAR, 7z, ZIP)
+  -> Verify & Repair (PAR2, bounded repair workers)
+  -> Extract (RAR, 7z, ZIP, bounded extraction workers)
   -> Complete
 ```
+
+When one job leaves the download phase, its download slot is immediately
+available to the next queued job. Post-processing uses independent global
+limits (`max_post_processing_jobs`, `max_repair_workers`, and
+`max_extract_workers`), so a download, a repair, and an extraction may overlap
+without allowing CPU- or disk-heavy stages to grow without bound. Higher
+limits increase throughput at the cost of memory, CPU, and disk contention.
+Interrupted post-processing jobs resume from the post-processing boundary on
+restart.
 
 ---
 

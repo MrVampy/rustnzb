@@ -58,6 +58,15 @@ pub struct GeneralConfig {
     pub history_retention: Option<usize>,
     /// Max number of NZBs downloading simultaneously (default 1)
     pub max_active_downloads: usize,
+    /// Max number of independent jobs in post-processing at once.
+    #[serde(default = "default_max_post_processing_jobs")]
+    pub max_post_processing_jobs: usize,
+    /// Max number of concurrent PAR2 verify/repair workers.
+    #[serde(default = "default_max_repair_workers")]
+    pub max_repair_workers: usize,
+    /// Max number of concurrent archive extraction workers.
+    #[serde(default = "default_max_extract_workers")]
+    pub max_extract_workers: usize,
     /// Minimum free disk space in bytes before pausing downloads (default 1 GB)
     #[serde(default = "default_min_free_space")]
     pub min_free_space_bytes: u64,
@@ -108,6 +117,18 @@ fn default_min_free_space() -> u64 {
     1_073_741_824 // 1 GB
 }
 
+fn default_max_post_processing_jobs() -> usize {
+    2
+}
+
+fn default_max_repair_workers() -> usize {
+    1
+}
+
+fn default_max_extract_workers() -> usize {
+    1
+}
+
 fn default_required_completion_pct() -> f64 {
     100.2
 }
@@ -135,6 +156,9 @@ impl Default for GeneralConfig {
             log_file: None,
             history_retention: None, // keep all
             max_active_downloads: 1,
+            max_post_processing_jobs: default_max_post_processing_jobs(),
+            max_repair_workers: default_max_repair_workers(),
+            max_extract_workers: default_max_extract_workers(),
             min_free_space_bytes: default_min_free_space(),
             watch_dir: None,
             rss_history_limit: default_rss_history_limit(),
@@ -374,6 +398,9 @@ mod tests {
         assert!(cfg.log_file.is_none());
         assert!(cfg.history_retention.is_none());
         assert_eq!(cfg.max_active_downloads, 1);
+        assert_eq!(cfg.max_post_processing_jobs, 2);
+        assert_eq!(cfg.max_repair_workers, 1);
+        assert_eq!(cfg.max_extract_workers, 1);
         assert_eq!(cfg.min_free_space_bytes, 1_073_741_824);
         assert!(cfg.watch_dir.is_none());
         assert_eq!(cfg.rss_history_limit, Some(500));

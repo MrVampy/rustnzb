@@ -19,7 +19,10 @@ use crate::nzb_core::config::{CategoryConfig, ServerConfig};
 use crate::nzb_core::db::Database;
 use crate::nzb_core::models::*;
 use crate::nzb_core::nzb_parser;
-use nzb_postproc::{PostProcConfig, has_usable_output, parse_rar_volume, run_pipeline};
+use nzb_postproc::{
+    PostProcConfig, PostProcLimits, PostProcResourcePool, PostProcResourceSnapshot,
+    has_usable_output, parse_rar_volume, run_pipeline_with_resources,
+};
 
 use crate::direct_unpack::DirectUnpacker;
 use crate::log_buffer::LogBuffer;
@@ -698,6 +701,8 @@ pub struct QueueManager {
     add_tx: broadcast::Sender<JobAddedEvent>,
     /// Max concurrent active downloads (0 = unlimited).
     max_active_downloads: AtomicUsize,
+    /// Stage-specific resource gates shared by all post-processing jobs.
+    postproc_resources: Arc<PostProcResourcePool>,
     /// Category configs for post-processing decisions.
     categories: Mutex<Vec<CategoryConfig>>,
     /// Minimum free disk space in bytes before pausing downloads.
@@ -744,6 +749,46 @@ impl QueueManager {
         required_completion_pct: f64,
         article_timeout_secs: u64,
     ) -> Arc<Self> {
+        Self::new_with_postproc_limits(
+            servers,
+            db,
+            incomplete_dir,
+            complete_dir,
+            log_buffer,
+            max_active_downloads,
+            PostProcLimits::default(),
+            categories,
+            min_free_space,
+            speed_limit_bps,
+            direct_unpack,
+            max_nested_archive_depth,
+            abort_hopeless,
+            early_failure_check,
+            required_completion_pct,
+            article_timeout_secs,
+        )
+    }
+
+    /// Create a queue manager with explicit post-processing worker limits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_postproc_limits(
+        servers: Vec<ServerConfig>,
+        db: Database,
+        incomplete_dir: std::path::PathBuf,
+        complete_dir: std::path::PathBuf,
+        log_buffer: LogBuffer,
+        max_active_downloads: usize,
+        postproc_limits: PostProcLimits,
+        categories: Vec<CategoryConfig>,
+        min_free_space: u64,
+        speed_limit_bps: u64,
+        direct_unpack: bool,
+        max_nested_archive_depth: u8,
+        abort_hopeless: bool,
+        early_failure_check: bool,
+        required_completion_pct: f64,
+        article_timeout_secs: u64,
+    ) -> Arc<Self> {
         use std::num::NonZeroU32;
 
         let download_bps = if speed_limit_bps > 0 {
@@ -779,6 +824,7 @@ impl QueueManager {
             log_buffer: Some(log_buffer),
             add_tx,
             max_active_downloads: AtomicUsize::new(max_active_downloads),
+            postproc_resources: PostProcResourcePool::new(postproc_limits),
             categories: Mutex::new(categories),
             min_free_space,
             bandwidth,
@@ -919,6 +965,11 @@ impl QueueManager {
     /// Get max active downloads.
     pub fn get_max_active_downloads(&self) -> usize {
         self.max_active_downloads.load(Ordering::Relaxed)
+    }
+
+    /// Configured and observed post-processing concurrency.
+    pub fn postproc_resource_snapshot(&self) -> PostProcResourceSnapshot {
+        self.postproc_resources.snapshot()
     }
 
     /// Set the download speed limit in bytes per second (0 = unlimited).
@@ -1724,6 +1775,9 @@ impl QueueManager {
         articles_failed: usize,
     ) {
         let pipeline_start = Instant::now();
+        // A download slot is already free at this point. Bound the independent
+        // post-processing job before taking any stage-specific resource.
+        let _pipeline_permit = self.postproc_resources.acquire_pipeline().await;
 
         // Extract info needed for post-processing and take the direct unpacker.
         let (
@@ -1822,7 +1876,9 @@ impl QueueManager {
                 max_nested_archive_depth: self.max_nested_archive_depth,
             };
 
-            let result = run_pipeline(&work_dir, &config).await;
+            let result =
+                run_pipeline_with_resources(&work_dir, &config, Some(&self.postproc_resources))
+                    .await;
 
             info!(
                 job_id = %job_id,
@@ -3133,8 +3189,24 @@ impl QueueManager {
 
         info!(count = jobs.len(), "Restoring jobs from database");
 
+        let mut postproc_recovery = Vec::new();
         for mut job in jobs {
             let job_id = job.id.clone();
+
+            // A process can stop after the final article closed but before the
+            // pipeline committed history. Resume from the idempotent stage
+            // boundary instead of leaving the job permanently stranded.
+            let was_post_processing = matches!(
+                job.status,
+                JobStatus::PostProcessing
+                    | JobStatus::Verifying
+                    | JobStatus::Repairing
+                    | JobStatus::Extracting
+            );
+            if was_post_processing {
+                job.status = JobStatus::PostProcessing;
+                postproc_recovery.push((job_id.clone(), job.articles_failed));
+            }
 
             // Only load full NZB data + checkpoints for jobs that were actively
             // downloading. Queued/paused jobs just need metadata — their NZB data
@@ -3240,6 +3312,16 @@ impl QueueManager {
 
         // Start queued jobs up to the concurrency limit
         self.start_next_queued();
+
+        for (job_id, articles_failed) in postproc_recovery {
+            let manager = Arc::clone(self);
+            tokio::spawn(async move {
+                info!(job_id, "Resuming interrupted post-processing pipeline");
+                manager
+                    .on_job_finished(&job_id, articles_failed == 0, articles_failed)
+                    .await;
+            });
+        }
 
         Ok(())
     }
@@ -3911,6 +3993,49 @@ mod global_pause_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn interrupted_post_processing_resumes_into_terminal_history() {
+        let (manager, tempdir) = manager();
+        let mut interrupted = job(
+            "restart-postproc",
+            JobStatus::PostProcessing,
+            tempdir.path(),
+        );
+        std::fs::create_dir_all(&interrupted.work_dir).unwrap();
+        std::fs::write(interrupted.work_dir.join("payload.mkv"), b"payload").unwrap();
+        interrupted.total_bytes = 7;
+        interrupted.downloaded_bytes = 7;
+        manager.db.lock().queue_insert(&interrupted).unwrap();
+
+        manager.restore_from_db().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager
+                    .db
+                    .lock()
+                    .history_get("restart-postproc")
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovered post-processing should reach terminal history");
+
+        let history = manager
+            .db
+            .lock()
+            .history_get("restart-postproc")
+            .unwrap()
+            .unwrap();
+        assert_eq!(history.status, JobStatus::Completed);
+        assert!(interrupted.output_dir.join("payload.mkv").exists());
     }
 }
 

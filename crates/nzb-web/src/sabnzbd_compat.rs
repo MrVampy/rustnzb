@@ -27,7 +27,11 @@ pub struct SabApiRequest {
     pub apikey: Option<String>,
     pub output: Option<String>,
     pub cat: Option<String>,
+    pub category: Option<String>,
     pub priority: Option<String>,
+    pub status: Option<String>,
+    pub search: Option<String>,
+    pub nzo_ids: Option<String>,
     pub start: Option<usize>,
     pub limit: Option<usize>,
     pub password: Option<String>,
@@ -330,7 +334,11 @@ pub async fn h_sabnzbd_api_post(
                 apikey,
                 output: None,
                 cat,
+                category: query_req.category,
                 priority,
+                status: query_req.status,
+                search: query_req.search,
+                nzo_ids: query_req.nzo_ids,
                 start: query_req.start,
                 limit: query_req.limit,
                 password,
@@ -416,34 +424,170 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     let jobs = qm.get_active_jobs();
     let paused = qm.is_paused();
     let speed_bps = qm.get_speed();
+    let speed_limit_bps = qm.get_speed_limit();
 
-    let slots: Vec<SabQueueSlot> = jobs.iter().map(SabQueueSlot::from_job).collect();
+    Json(build_queue_response(
+        &jobs,
+        paused,
+        speed_bps,
+        speed_limit_bps,
+        req,
+    ))
+}
 
-    let total_mb: f64 = jobs.iter().map(|j| j.total_bytes as f64).sum::<f64>() / 1_048_576.0;
-    let left_mb: f64 = jobs
+fn build_queue_response(
+    jobs: &[NzbJob],
+    paused: bool,
+    speed_bps: u64,
+    speed_limit_bps: u64,
+    req: &SabApiRequest,
+) -> serde_json::Value {
+    let start = req.start.unwrap_or(0);
+    let limit = req.limit.unwrap_or(0);
+    let category_query = req
+        .cat
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or(req.category.as_deref());
+    let categories = comma_separated(category_query);
+    let priorities = comma_separated(req.priority.as_deref());
+    let statuses = comma_separated(req.status.as_deref());
+    let nzo_ids = comma_separated(req.nzo_ids.as_deref());
+    let search = req
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+
+    let matching_jobs: Vec<&NzbJob> = jobs
         .iter()
-        .map(|j| (j.total_bytes.saturating_sub(j.downloaded_bytes)) as f64)
-        .sum::<f64>()
-        / 1_048_576.0;
+        .filter(|job| {
+            search
+                .as_ref()
+                .is_none_or(|term| job.name.to_lowercase().contains(term))
+                && (categories.is_empty()
+                    || categories
+                        .iter()
+                        .any(|category| category.eq_ignore_ascii_case(&job.category)))
+                && (priorities.is_empty()
+                    || priorities
+                        .iter()
+                        .any(|priority| sab_priority_matches(job.priority, priority)))
+                && (statuses.is_empty()
+                    || statuses
+                        .iter()
+                        .any(|status| status.eq_ignore_ascii_case(sab_queue_status(job.status))))
+                && (nzo_ids.is_empty()
+                    || nzo_ids
+                        .iter()
+                        .any(|nzo_id| queue_nzo_id(job).eq_ignore_ascii_case(nzo_id)))
+        })
+        .collect();
 
-    Json(serde_json::json!({
+    let page = matching_jobs
+        .iter()
+        .skip(start)
+        .take(if limit == 0 { usize::MAX } else { limit });
+    let mut running_bytes = matching_jobs
+        .iter()
+        .take(start)
+        .filter(|job| queue_totals_include(job))
+        .map(|job| remaining_bytes(job))
+        .fold(0_u64, u64::saturating_add);
+    let slots: Vec<SabQueueSlot> = page
+        .enumerate()
+        .map(|(offset, job)| {
+            if queue_totals_include(job) {
+                running_bytes = running_bytes.saturating_add(remaining_bytes(job));
+            }
+            SabQueueSlot::from_job(job, start + offset, paused, running_bytes, speed_bps)
+        })
+        .collect();
+
+    let active_totals = jobs.iter().filter(|job| queue_totals_include(job));
+    let total_bytes = active_totals
+        .clone()
+        .map(|job| job.total_bytes)
+        .fold(0_u64, u64::saturating_add);
+    let bytes_left = active_totals
+        .map(remaining_bytes)
+        .fold(0_u64, u64::saturating_add);
+    let total_slots = jobs.iter().filter(|job| queue_totals_include(job)).count();
+    let total_mb = total_bytes as f64 / 1_048_576.0;
+    let left_mb = bytes_left as f64 / 1_048_576.0;
+
+    serde_json::json!({
         "queue": {
-            "status": if paused { "Paused" } else { "Downloading" },
-            "speedlimit": "",
+            "version": env!("CARGO_PKG_VERSION"),
+            "status": queue_status(paused, speed_bps),
+            "paused": paused,
+            "pause_int": "0",
+            "paused_all": paused,
+            "speedlimit": "0",
+            "speedlimit_abs": speed_limit_bps.to_string(),
             "speed": format_speed(speed_bps),
             "kbpersec": format!("{:.2}", speed_bps as f64 / 1024.0),
             "mbleft": format!("{left_mb:.2}"),
             "mb": format!("{total_mb:.2}"),
-            "noofslots_total": jobs.len(),
-            "noofslots": slots.len(),
-            "paused": paused,
-            "limit": req.limit.unwrap_or(0),
-            "start": req.start.unwrap_or(0),
-            "timeleft": "0:00:00",
-            "eta": "unknown",
+            "sizeleft": format_size_human(bytes_left),
+            "size": format_size_human(total_bytes),
+            "noofslots_total": total_slots,
+            "noofslots": matching_jobs.len(),
+            "limit": limit,
+            "start": start,
+            "finish": start.saturating_add(limit),
+            "timeleft": format_timeleft(bytes_left, speed_bps),
+            "diskspace1": "0.00",
+            "diskspace2": "0.00",
+            "diskspace1_norm": "0 B",
+            "diskspace2_norm": "0 B",
+            "diskspacetotal1": "0.00",
+            "diskspacetotal2": "0.00",
+            "have_warnings": "0",
+            "finishaction": null,
+            "quota": "0 B",
+            "have_quota": false,
+            "left_quota": "0 B",
+            "cache_art": "0",
+            "cache_size": "0 B",
             "slots": slots
         }
-    }))
+    })
+}
+
+fn comma_separated(value: Option<&str>) -> Vec<&str> {
+    value
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn sab_priority_matches(priority: Priority, requested: &str) -> bool {
+    let numeric = match priority {
+        Priority::Low => "-1",
+        Priority::Normal => "0",
+        Priority::High => "1",
+        Priority::Force => "2",
+    };
+    requested == numeric || requested.eq_ignore_ascii_case(sab_priority_name(priority))
+}
+
+fn queue_status(paused: bool, speed_bps: u64) -> &'static str {
+    if paused {
+        "Paused"
+    } else if speed_bps > 0 {
+        "Downloading"
+    } else {
+        "Idle"
+    }
+}
+
+fn queue_totals_include(job: &NzbJob) -> bool {
+    job.priority == Priority::Force
+        || !matches!(job.status, JobStatus::Paused | JobStatus::Verifying)
 }
 
 /// Handle mode=queue&name=delete&value=nzo_ID (SABnzbd queue delete)
@@ -890,51 +1034,92 @@ fn sab_priority_to_priority(s: &str) -> Priority {
 
 #[derive(Serialize)]
 struct SabQueueSlot {
+    index: usize,
     nzo_id: String,
+    unpackopts: String,
+    script: String,
     filename: String,
+    labels: Vec<String>,
+    password: String,
     cat: String,
     status: String,
     priority: String,
     mb: String,
     mbleft: String,
     percentage: String,
+    mbmissing: String,
+    direct_unpack: Option<String>,
     timeleft: String,
-    eta: String,
     avg_age: String,
     size: String,
     sizeleft: String,
+    time_added: i64,
 }
 
 impl SabQueueSlot {
-    fn from_job(job: &NzbJob) -> Self {
+    fn from_job(
+        job: &NzbJob,
+        index: usize,
+        globally_paused: bool,
+        running_bytes: u64,
+        speed_bps: u64,
+    ) -> Self {
         let mb = job.total_bytes as f64 / 1_048_576.0;
-        let mbleft = (job.total_bytes.saturating_sub(job.downloaded_bytes)) as f64 / 1_048_576.0;
+        let mbleft = remaining_bytes(job) as f64 / 1_048_576.0;
         let pct = if job.total_bytes > 0 {
             (job.downloaded_bytes as f64 / job.total_bytes as f64 * 100.0) as u32
         } else {
             0
         };
+        let paused = globally_paused || job.status == JobStatus::Paused;
 
         Self {
-            nzo_id: format!("SABnzbd_nzo_{}", &job.id[..12.min(job.id.len())]),
+            index,
+            nzo_id: queue_nzo_id(job),
+            unpackopts: "3".into(),
+            script: "None".into(),
             filename: job.name.clone(),
-            cat: job.category.clone(),
-            status: sab_queue_status(job.status).into(),
-            priority: match job.priority {
-                Priority::Force => "Force".into(),
-                Priority::High => "High".into(),
-                Priority::Normal => "Normal".into(),
-                Priority::Low => "Low".into(),
+            labels: Vec::new(),
+            password: job.password.clone().unwrap_or_default(),
+            cat: if job.category.is_empty() {
+                "None".into()
+            } else {
+                job.category.clone()
             },
+            status: sab_queue_status(job.status).into(),
+            priority: sab_priority_name(job.priority).into(),
             mb: format!("{mb:.2}"),
             mbleft: format!("{mbleft:.2}"),
             percentage: format!("{pct}"),
-            timeleft: "0:00:00".into(),
-            eta: "unknown".into(),
-            avg_age: "0d".into(),
+            mbmissing: "0.00".into(),
+            direct_unpack: None,
+            timeleft: if paused {
+                "0:00:00".into()
+            } else {
+                format_timeleft(running_bytes, speed_bps)
+            },
+            avg_age: "-".into(),
             size: format_size_human(job.total_bytes),
-            sizeleft: format_size_human(job.total_bytes.saturating_sub(job.downloaded_bytes)),
+            sizeleft: format_size_human(remaining_bytes(job)),
+            time_added: job.added_at.timestamp(),
         }
+    }
+}
+
+fn queue_nzo_id(job: &NzbJob) -> String {
+    format!("SABnzbd_nzo_{}", &job.id[..12.min(job.id.len())])
+}
+
+fn remaining_bytes(job: &NzbJob) -> u64 {
+    job.total_bytes.saturating_sub(job.downloaded_bytes)
+}
+
+fn sab_priority_name(priority: Priority) -> &'static str {
+    match priority {
+        Priority::Force => "Force",
+        Priority::High => "High",
+        Priority::Normal => "Normal",
+        Priority::Low => "Low",
     }
 }
 
@@ -1047,9 +1232,47 @@ fn format_speed(bps: u64) -> String {
     }
 }
 
+fn format_timeleft(bytes_left: u64, speed_bps: u64) -> String {
+    if bytes_left == 0 || speed_bps == 0 {
+        return "0:00:00".into();
+    }
+
+    let seconds = bytes_left / speed_bps;
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    format!("{hours}:{minutes:02}:{seconds:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queue_job(id: &str, name: &str, category: &str, status: JobStatus) -> NzbJob {
+        NzbJob {
+            id: id.into(),
+            name: name.into(),
+            category: category.into(),
+            status,
+            priority: Priority::Normal,
+            total_bytes: 10 * 1_048_576,
+            downloaded_bytes: 2 * 1_048_576,
+            file_count: 2,
+            files_completed: 0,
+            article_count: 10,
+            articles_downloaded: 2,
+            articles_failed: 0,
+            added_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            completed_at: None,
+            work_dir: "/downloads/incomplete".into(),
+            output_dir: "/downloads/complete".into(),
+            password: Some("secret".into()),
+            error_message: None,
+            speed_bps: 0,
+            server_stats: Vec::new(),
+            files: Vec::new(),
+        }
+    }
 
     #[test]
     fn queue_statuses_use_sabnzbd_vocabulary() {
@@ -1068,6 +1291,119 @@ mod tests {
         for (status, expected) in cases {
             assert_eq!(sab_queue_status(status), expected);
         }
+    }
+
+    #[test]
+    fn queue_envelope_and_slot_fields_match_sab_types() {
+        let jobs = vec![queue_job(
+            "1234567890abcdef",
+            "Example.Show",
+            "tv",
+            JobStatus::Downloading,
+        )];
+        let response = build_queue_response(
+            &jobs,
+            false,
+            1_048_576,
+            2_097_152,
+            &SabApiRequest::default(),
+        );
+        let queue = &response["queue"];
+        let slot = &queue["slots"][0];
+
+        assert_eq!(queue["status"], "Downloading");
+        assert_eq!(queue["noofslots_total"], 1);
+        assert_eq!(queue["noofslots"], 1);
+        assert_eq!(queue["timeleft"], "0:00:08");
+        assert_eq!(queue["speedlimit_abs"], "2097152");
+        assert!(queue["paused"].is_boolean());
+        assert!(queue["slots"].is_array());
+
+        assert_eq!(slot["index"], 0);
+        assert_eq!(slot["nzo_id"], "SABnzbd_nzo_1234567890ab");
+        assert_eq!(slot["unpackopts"], "3");
+        assert_eq!(slot["script"], "None");
+        assert_eq!(slot["labels"], serde_json::json!([]));
+        assert_eq!(slot["password"], "secret");
+        assert_eq!(slot["mbmissing"], "0.00");
+        assert!(slot["direct_unpack"].is_null());
+        assert_eq!(slot["time_added"], 1_700_000_000_i64);
+    }
+
+    #[test]
+    fn queue_status_is_idle_when_unpaused_at_zero_speed() {
+        let response = build_queue_response(
+            &[queue_job("idle", "Idle job", "tv", JobStatus::Downloading)],
+            false,
+            0,
+            0,
+            &SabApiRequest::default(),
+        );
+        assert_eq!(response["queue"]["status"], "Idle");
+        assert_eq!(response["queue"]["timeleft"], "0:00:00");
+    }
+
+    #[test]
+    fn empty_and_paused_queues_have_sab_statuses() {
+        let empty = build_queue_response(&[], false, 0, 0, &SabApiRequest::default());
+        assert_eq!(empty["queue"]["status"], "Idle");
+        assert_eq!(empty["queue"]["slots"], serde_json::json!([]));
+        assert_eq!(empty["queue"]["noofslots_total"], 0);
+
+        let paused = build_queue_response(
+            &[queue_job("paused", "Paused job", "tv", JobStatus::Paused)],
+            true,
+            1_048_576,
+            0,
+            &SabApiRequest::default(),
+        );
+        assert_eq!(paused["queue"]["status"], "Paused");
+        assert_eq!(paused["queue"]["slots"][0]["timeleft"], "0:00:00");
+    }
+
+    #[test]
+    fn queue_applies_filters_before_pagination() {
+        let jobs = vec![
+            queue_job("one", "Show.One", "tv", JobStatus::Queued),
+            queue_job("two", "Movie.One", "movies", JobStatus::Downloading),
+            queue_job("three", "Show.Two", "tv", JobStatus::Paused),
+            queue_job("four", "Show.Three", "tv", JobStatus::Downloading),
+        ];
+        let req = SabApiRequest {
+            search: Some("show".into()),
+            cat: Some("tv".into()),
+            start: Some(1),
+            limit: Some(1),
+            ..SabApiRequest::default()
+        };
+        let response = build_queue_response(&jobs, false, 0, 0, &req);
+        let queue = &response["queue"];
+
+        assert_eq!(queue["noofslots_total"], 3);
+        assert_eq!(queue["noofslots"], 3);
+        assert_eq!(queue["start"], 1);
+        assert_eq!(queue["limit"], 1);
+        assert_eq!(queue["finish"], 2);
+        assert_eq!(queue["slots"].as_array().unwrap().len(), 1);
+        assert_eq!(queue["slots"][0]["filename"], "Show.Two");
+        assert_eq!(queue["slots"][0]["index"], 1);
+    }
+
+    #[test]
+    fn queue_supports_status_priority_and_id_filters() {
+        let mut high = queue_job("high-priority", "First", "tv", JobStatus::Downloading);
+        high.priority = Priority::High;
+        let normal = queue_job("normal", "Second", "tv", JobStatus::Downloading);
+        let req = SabApiRequest {
+            priority: Some("1".into()),
+            status: Some("downloading".into()),
+            nzo_ids: Some("SABnzbd_nzo_high-priorit".into()),
+            ..SabApiRequest::default()
+        };
+        let response = build_queue_response(&[high, normal], false, 0, 0, &req);
+
+        assert_eq!(response["queue"]["noofslots"], 1);
+        assert_eq!(response["queue"]["slots"][0]["filename"], "First");
     }
 
     #[test]

@@ -34,6 +34,9 @@ pub struct SabApiRequest {
     pub nzo_ids: Option<String>,
     pub start: Option<usize>,
     pub limit: Option<usize>,
+    pub failed_only: Option<String>,
+    pub archive: Option<String>,
+    pub last_history_update: Option<u64>,
     pub password: Option<String>,
 }
 
@@ -341,6 +344,9 @@ pub async fn h_sabnzbd_api_post(
                 nzo_ids: query_req.nzo_ids,
                 start: query_req.start,
                 limit: query_req.limit,
+                failed_only: query_req.failed_only,
+                archive: query_req.archive,
+                last_history_update: query_req.last_history_update,
                 password,
             };
             Ok(dispatch_mode(
@@ -677,17 +683,146 @@ fn handle_history(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Val
         return handle_history_delete(state, req);
     }
 
-    let limit = req.limit.unwrap_or(50);
-    let entries = qm.history_list(limit).unwrap_or_default();
-    let slots: Vec<SabHistorySlot> = entries.iter().map(SabHistorySlot::from_entry).collect();
+    let history_update = qm.history_update();
+    if history_is_unchanged(req.last_history_update, history_update) {
+        return Json(unchanged_history_response());
+    }
 
-    Json(serde_json::json!({
+    let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
+    let postprocessing: Vec<_> = qm
+        .get_jobs()
+        .into_iter()
+        .filter(|job| {
+            matches!(
+                job.status,
+                JobStatus::Verifying
+                    | JobStatus::Repairing
+                    | JobStatus::Extracting
+                    | JobStatus::PostProcessing
+            )
+        })
+        .collect();
+
+    Json(build_history_response(
+        &entries,
+        &postprocessing,
+        req,
+        history_update,
+    ))
+}
+
+fn build_history_response(
+    entries: &[HistoryEntry],
+    postprocessing: &[NzbJob],
+    req: &SabApiRequest,
+    history_update: u64,
+) -> serde_json::Value {
+    let mut slots: Vec<SabHistorySlot> = postprocessing
+        .iter()
+        .map(SabHistorySlot::from_postprocessing)
+        .chain(entries.iter().map(SabHistorySlot::from_entry))
+        .filter(|slot| history_slot_matches(slot, req))
+        .collect();
+    let noofslots = slots.len();
+    let ppslots = slots.iter().filter(|slot| slot.postprocessing).count();
+    let start = req.start.unwrap_or(0).min(slots.len());
+    let limit = req.limit.filter(|limit| *limit != 0).unwrap_or(50);
+    let end = start.saturating_add(limit).min(slots.len());
+    slots = slots.drain(start..end).collect();
+
+    let total_bytes: u64 = entries.iter().map(|entry| entry.downloaded_bytes).sum();
+    let now = chrono::Utc::now();
+    let period_bytes = |days| {
+        entries
+            .iter()
+            .filter(|entry| entry.completed_at >= now - chrono::Duration::days(days))
+            .map(|entry| entry.downloaded_bytes)
+            .sum::<u64>()
+    };
+
+    serde_json::json!({
         "history": {
-            "noofslots": entries.len(),
-            "last_history_update": chrono::Utc::now().timestamp(),
-            "slots": slots
+            "total_size": format_size_human(total_bytes),
+            "month_size": format_size_human(period_bytes(30)),
+            "week_size": format_size_human(period_bytes(7)),
+            "day_size": format_size_human(period_bytes(1)),
+            "slots": slots,
+            "noofslots": noofslots,
+            "ppslots": ppslots,
+            "last_history_update": history_update,
+            "version": "4.3.3"
         }
-    }))
+    })
+}
+
+fn history_is_unchanged(requested: Option<u64>, current: u64) -> bool {
+    requested == Some(current)
+}
+
+fn unchanged_history_response() -> serde_json::Value {
+    serde_json::json!({ "history": false })
+}
+
+fn history_slot_matches(slot: &SabHistorySlot, req: &SabApiRequest) -> bool {
+    // RustNZB currently has no archived-history tier, so an archive-only
+    // request correctly has no matches.
+    if req.archive.as_deref().is_some_and(sab_query_bool) {
+        return false;
+    }
+
+    if let Some(search) = req.search.as_deref().filter(|value| !value.is_empty()) {
+        let search = search.to_lowercase();
+        if !slot.name.to_lowercase().contains(&search)
+            && !slot.nzb_name.to_lowercase().contains(&search)
+        {
+            return false;
+        }
+    }
+
+    let categories = req.cat.as_deref().or(req.category.as_deref());
+    if !matches_csv(categories, &slot.category) {
+        return false;
+    }
+
+    let failed_only = req.failed_only.as_deref().is_some_and(sab_query_bool);
+    if failed_only {
+        if !slot.status.eq_ignore_ascii_case("Failed") {
+            return false;
+        }
+    } else if !matches_csv(req.status.as_deref(), &slot.status) {
+        return false;
+    }
+
+    req.nzo_ids.as_deref().is_none_or(|ids| {
+        ids.is_empty()
+            || ids.split(',').map(str::trim).any(|id| {
+                id == slot.nzo_id
+                    || slot
+                        .nzo_id
+                        .strip_prefix("SABnzbd_nzo_")
+                        .is_some_and(|raw| raw == id)
+                    || id
+                        .strip_prefix("SABnzbd_nzo_")
+                        .is_some_and(|raw| slot.nzo_id.ends_with(raw))
+            })
+    })
+}
+
+fn matches_csv(values: Option<&str>, actual: &str) -> bool {
+    values.is_none_or(|values| {
+        values.is_empty()
+            || values
+                .split(',')
+                .map(str::trim)
+                .any(|value| value.eq_ignore_ascii_case(actual))
+    })
+}
+
+fn sab_query_bool(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Handle mode=history&name=delete&value=nzo_ID (SABnzbd history delete)
@@ -1142,18 +1277,40 @@ fn sab_queue_status(status: JobStatus) -> &'static str {
 
 #[derive(Serialize)]
 struct SabHistorySlot {
-    nzo_id: String,
-    name: String,
-    category: String,
-    status: String,
-    bytes: u64,
-    storage: String,
     completed: i64,
-    fail_message: String,
-    download_time: u64,
-    pp: String,
+    name: String,
     nzb_name: String,
+    category: String,
+    pp: String,
+    script: String,
+    report: String,
+    url: String,
+    status: String,
+    nzo_id: String,
+    storage: String,
+    path: String,
+    script_line: String,
+    download_time: u64,
+    postproc_time: u64,
     stage_log: Vec<SabStageLog>,
+    downloaded: u64,
+    completeness: Option<u8>,
+    fail_message: String,
+    url_info: String,
+    bytes: u64,
+    meta: Option<String>,
+    series: String,
+    duplicate_key: String,
+    md5sum: String,
+    password: String,
+    action_line: String,
+    size: String,
+    loaded: bool,
+    retry: bool,
+    archive: bool,
+    time_added: i64,
+    #[serde(skip)]
+    postprocessing: bool,
 }
 
 #[derive(Serialize)]
@@ -1173,19 +1330,26 @@ impl SabHistorySlot {
             })
             .collect();
 
+        let storage = entry.output_dir.to_string_lossy().to_string();
+        let bytes = entry.downloaded_bytes;
         Self {
-            nzo_id: format!("SABnzbd_nzo_{}", &entry.id[..12.min(entry.id.len())]),
+            completed: entry.completed_at.timestamp(),
             name: entry.name.clone(),
+            nzb_name: format!("{}.nzb", entry.name),
             category: entry.category.clone(),
+            pp: "D".into(),
+            script: String::new(),
+            report: String::new(),
+            url: String::new(),
             status: match entry.status {
                 JobStatus::Completed => "Completed".into(),
                 JobStatus::Failed => "Failed".into(),
                 _ => entry.status.to_string(),
             },
-            bytes: entry.downloaded_bytes,
-            storage: entry.output_dir.to_string_lossy().to_string(),
-            completed: entry.completed_at.timestamp(),
-            fail_message: entry.error_message.clone().unwrap_or_default(),
+            nzo_id: sab_nzo_id(&entry.id),
+            storage: storage.clone(),
+            path: storage,
+            script_line: String::new(),
             download_time: entry
                 .download_time_secs
                 .unwrap_or_else(|| {
@@ -1193,10 +1357,81 @@ impl SabHistorySlot {
                 })
                 .round()
                 .max(0.0) as u64,
-            pp: "D".into(),
-            nzb_name: format!("{}.nzb", entry.name),
+            postproc_time: entry
+                .stages
+                .iter()
+                .map(|stage| stage.duration_secs.max(0.0))
+                .sum::<f64>()
+                .round() as u64,
             stage_log,
+            downloaded: bytes,
+            completeness: None,
+            fail_message: entry.error_message.clone().unwrap_or_default(),
+            url_info: String::new(),
+            bytes,
+            meta: None,
+            series: String::new(),
+            duplicate_key: String::new(),
+            md5sum: "00000000000000000000000000000000".into(),
+            password: String::new(),
+            action_line: String::new(),
+            size: format_size_human(bytes),
+            loaded: false,
+            retry: entry.status == JobStatus::Failed && entry.nzb_data.is_some(),
+            archive: false,
+            time_added: entry.added_at.timestamp(),
+            postprocessing: false,
         }
+    }
+
+    fn from_postprocessing(job: &NzbJob) -> Self {
+        let path = job.work_dir.to_string_lossy().to_string();
+        Self {
+            completed: job
+                .completed_at
+                .unwrap_or_else(chrono::Utc::now)
+                .timestamp(),
+            name: job.name.clone(),
+            nzb_name: format!("{}.nzb", job.name),
+            category: job.category.clone(),
+            pp: "D".into(),
+            script: String::new(),
+            report: String::new(),
+            url: String::new(),
+            status: sab_queue_status(job.status).into(),
+            nzo_id: sab_nzo_id(&job.id),
+            storage: String::new(),
+            path,
+            script_line: String::new(),
+            download_time: 0,
+            postproc_time: 0,
+            stage_log: Vec::new(),
+            downloaded: job.downloaded_bytes,
+            completeness: None,
+            fail_message: job.error_message.clone().unwrap_or_default(),
+            url_info: String::new(),
+            bytes: job.downloaded_bytes,
+            meta: None,
+            series: String::new(),
+            duplicate_key: String::new(),
+            md5sum: "00000000000000000000000000000000".into(),
+            password: job.password.clone().unwrap_or_default(),
+            action_line: job.status.to_string(),
+            size: format_size_human(job.downloaded_bytes),
+            loaded: true,
+            retry: false,
+            archive: false,
+            time_added: job.added_at.timestamp(),
+            postprocessing: true,
+        }
+    }
+}
+
+fn sab_nzo_id(id: &str) -> String {
+    if id.starts_with("SABnzbd_nzo_") {
+        id.to_string()
+    } else {
+        format!("SABnzbd_nzo_{}", &id[..12.min(id.len())])
     }
 }
 
@@ -1267,6 +1502,64 @@ mod tests {
             work_dir: "/downloads/incomplete".into(),
             output_dir: "/downloads/complete".into(),
             password: Some("secret".into()),
+            error_message: None,
+            speed_bps: 0,
+            server_stats: Vec::new(),
+            files: Vec::new(),
+        }
+    }
+
+    fn history_entry(
+        id: &str,
+        name: &str,
+        category: &str,
+        status: JobStatus,
+        seconds_ago: i64,
+    ) -> HistoryEntry {
+        let completed_at = chrono::Utc::now() - chrono::Duration::seconds(seconds_ago);
+        HistoryEntry {
+            id: id.into(),
+            name: name.into(),
+            category: category.into(),
+            status,
+            total_bytes: 10_000,
+            downloaded_bytes: 9_000,
+            added_at: completed_at - chrono::Duration::seconds(20),
+            completed_at,
+            download_time_secs: Some(12.4),
+            output_dir: format!("/downloads/{name}").into(),
+            stages: vec![StageResult {
+                name: "Unpack".into(),
+                status: StageStatus::Success,
+                message: Some("Unpacked".into()),
+                duration_secs: 3.6,
+            }],
+            error_message: (status == JobStatus::Failed).then(|| "broken archive".into()),
+            server_stats: Vec::new(),
+            nzb_data: (status == JobStatus::Failed).then(Vec::new),
+        }
+    }
+
+    fn postprocessing_job() -> NzbJob {
+        let now = chrono::Utc::now();
+        NzbJob {
+            id: "postprocessing-job".into(),
+            name: "Still Unpacking".into(),
+            category: "tv".into(),
+            status: JobStatus::PostProcessing,
+            priority: Priority::Normal,
+            total_bytes: 20_000,
+            downloaded_bytes: 20_000,
+            file_count: 1,
+            files_completed: 1,
+            article_count: 2,
+            articles_downloaded: 2,
+            articles_failed: 0,
+            added_at: now - chrono::Duration::minutes(1),
+            completed_at: Some(now),
+            work_dir: "/downloads/incomplete/postprocessing-job".into(),
+            output_dir: "/downloads/complete/Still Unpacking".into(),
+            password: None,
             error_message: None,
             speed_bps: 0,
             server_stats: Vec::new(),
@@ -1427,5 +1720,146 @@ mod tests {
         };
 
         assert_eq!(SabHistorySlot::from_entry(&entry).download_time, 2);
+    }
+
+    #[test]
+    fn history_completed_and_failed_slots_have_sab_field_types() {
+        let entries = [
+            history_entry(
+                "completed-item",
+                "Completed Item",
+                "movies",
+                JobStatus::Completed,
+                1,
+            ),
+            history_entry("failed-item", "Failed Item", "tv", JobStatus::Failed, 2),
+        ];
+        let response = build_history_response(&entries, &[], &SabApiRequest::default(), 7);
+        let history = &response["history"];
+        let slots = history["slots"].as_array().unwrap();
+
+        assert_eq!(history["noofslots"], 2);
+        assert_eq!(history["ppslots"], 0);
+        assert_eq!(history["last_history_update"], 7);
+        for slot in slots {
+            for field in [
+                "completed",
+                "name",
+                "nzb_name",
+                "category",
+                "pp",
+                "script",
+                "report",
+                "url",
+                "status",
+                "nzo_id",
+                "storage",
+                "path",
+                "script_line",
+                "download_time",
+                "postproc_time",
+                "stage_log",
+                "downloaded",
+                "completeness",
+                "fail_message",
+                "url_info",
+                "bytes",
+                "meta",
+                "series",
+                "duplicate_key",
+                "md5sum",
+                "password",
+                "action_line",
+                "size",
+                "loaded",
+                "retry",
+                "archive",
+                "time_added",
+            ] {
+                assert!(slot.get(field).is_some(), "missing field {field}");
+            }
+        }
+        assert_eq!(slots[0]["status"], "Completed");
+        assert_eq!(slots[1]["status"], "Failed");
+        assert_eq!(slots[1]["fail_message"], "broken archive");
+        assert_eq!(slots[1]["retry"], true);
+        assert!(slots[0]["bytes"].is_u64());
+        assert!(slots[0]["loaded"].is_boolean());
+        assert!(slots[0]["completeness"].is_null());
+    }
+
+    #[test]
+    fn history_includes_postprocessing_before_terminal_slots() {
+        let response = build_history_response(
+            &[history_entry(
+                "completed-item",
+                "Completed Item",
+                "movies",
+                JobStatus::Completed,
+                1,
+            )],
+            &[postprocessing_job()],
+            &SabApiRequest::default(),
+            4,
+        );
+
+        assert_eq!(response["history"]["ppslots"], 1);
+        assert_eq!(response["history"]["noofslots"], 2);
+        assert_eq!(response["history"]["slots"][0]["status"], "Running");
+        assert_eq!(response["history"]["slots"][0]["loaded"], true);
+    }
+
+    #[test]
+    fn history_filters_before_paging_and_reports_total_matches() {
+        let entries = [
+            history_entry(
+                "first-movie",
+                "First Movie",
+                "movies",
+                JobStatus::Completed,
+                1,
+            ),
+            history_entry(
+                "second-movie",
+                "Second Movie",
+                "movies",
+                JobStatus::Failed,
+                2,
+            ),
+            history_entry("tv-episode", "TV Episode", "tv", JobStatus::Failed, 3),
+        ];
+        let request = SabApiRequest {
+            start: Some(1),
+            limit: Some(1),
+            search: Some("movie".into()),
+            cat: Some("movies".into()),
+            status: Some("Completed,Failed".into()),
+            ..Default::default()
+        };
+        let response = build_history_response(&entries, &[], &request, 3);
+
+        assert_eq!(response["history"]["noofslots"], 2);
+        assert_eq!(response["history"]["slots"].as_array().unwrap().len(), 1);
+        assert_eq!(response["history"]["slots"][0]["name"], "Second Movie");
+
+        let id_request = SabApiRequest {
+            nzo_ids: Some("SABnzbd_nzo_tv-episode".into()),
+            failed_only: Some("1".into()),
+            ..Default::default()
+        };
+        let id_response = build_history_response(&entries, &[], &id_request, 3);
+        assert_eq!(id_response["history"]["noofslots"], 1);
+        assert_eq!(id_response["history"]["slots"][0]["name"], "TV Episode");
+    }
+
+    #[test]
+    fn matching_history_generation_uses_unchanged_response_contract() {
+        assert!(history_is_unchanged(Some(42), 42));
+        assert!(!history_is_unchanged(Some(41), 42));
+        assert!(!history_is_unchanged(None, 42));
+        assert_eq!(
+            unchanged_history_response(),
+            serde_json::json!({ "history": false })
+        );
     }
 }

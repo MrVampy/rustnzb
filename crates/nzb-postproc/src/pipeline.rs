@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use nzb_core::models::{StageResult, StageStatus};
@@ -15,6 +16,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::detect::{ArchiveType, find_archives, find_cleanup_files, find_par2_files};
 use crate::par2::par2_repair;
+use crate::resources::PostProcResourcePool;
 use crate::unpack::{extract_7z, extract_rar, extract_zip};
 
 fn increment_counter(name: &'static str) {
@@ -101,6 +103,19 @@ impl Default for PostProcConfig {
 /// 3. **Extract** — unpack RAR, 7z, ZIP archives
 /// 4. **Cleanup** — remove archive/par2 files (if configured)
 pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcResult {
+    run_pipeline_with_resources(job_dir, config, None).await
+}
+
+/// Run the pipeline under optional shared stage-specific resource gates.
+///
+/// This additive entry point keeps [`PostProcConfig`] source-compatible for
+/// library consumers while allowing applications to coordinate independent
+/// jobs through one [`PostProcResourcePool`].
+pub async fn run_pipeline_with_resources(
+    job_dir: &Path,
+    config: &PostProcConfig,
+    resources: Option<&Arc<PostProcResourcePool>>,
+) -> PostProcResult {
     let mut stages: Vec<StageResult> = Vec::new();
     let mut pipeline_ok = true;
 
@@ -154,6 +169,11 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
         });
     } else {
         let verify_start = Instant::now();
+        let _repair_permit = if let Some(resources) = resources {
+            Some(resources.acquire_repair().await)
+        } else {
+            None
+        };
         let index_par2 = par2_files[0].clone();
 
         match rust_par2::parse(&index_par2) {
@@ -363,6 +383,11 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
             output_dir
         } else {
             job_dir
+        };
+        let _extract_permit = if let Some(resources) = resources {
+            Some(resources.acquire_extract().await)
+        } else {
+            None
         };
         let (result, processed_archives) = run_extract_stage(
             source_dir,

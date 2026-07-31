@@ -307,6 +307,7 @@ pub struct StatusResponse {
     pub speed_bps: u64,
     pub speed_limit_bps: u64,
     pub queue_size: usize,
+    pub post_processing: PostProcessingStatus,
     pub disk_space_free: u64,
     /// Total filesystem capacity, 0 if unknown (see `get_disk_space_total`).
     pub disk_space_total: u64,
@@ -315,6 +316,19 @@ pub struct StatusResponse {
     pub webdav_available: bool,
     pub webdav_enabled: bool,
     pub nntp_connections: Vec<NntpConnectionStatus>,
+}
+
+#[derive(Serialize)]
+pub struct PostProcessingStatus {
+    pub active_jobs: usize,
+    pub active_repairs: usize,
+    pub active_extractions: usize,
+    pub peak_jobs: usize,
+    pub peak_repairs: usize,
+    pub peak_extractions: usize,
+    pub max_jobs: usize,
+    pub max_repairs: usize,
+    pub max_extractions: usize,
 }
 
 #[derive(Serialize)]
@@ -833,12 +847,24 @@ pub async fn h_status(
 ) -> Result<Json<StatusResponse>, ApiError> {
     let qm = &state.queue_manager;
     let config = state.config();
+    let postproc = qm.postproc_resource_snapshot();
     Ok(Json(StatusResponse {
         version: env!("RUSTNZB_BUILD_VERSION"),
         paused: qm.is_paused(),
         speed_bps: qm.get_speed(),
         speed_limit_bps: qm.get_speed_limit(),
         queue_size: qm.queue_size(),
+        post_processing: PostProcessingStatus {
+            active_jobs: postproc.active_pipelines,
+            active_repairs: postproc.active_repairs,
+            active_extractions: postproc.active_extractions,
+            peak_jobs: postproc.peak_pipelines,
+            peak_repairs: postproc.peak_repairs,
+            peak_extractions: postproc.peak_extractions,
+            max_jobs: config.general.max_post_processing_jobs.max(1),
+            max_repairs: config.general.max_repair_workers.max(1),
+            max_extractions: config.general.max_extract_workers.max(1),
+        },
         disk_space_free: get_disk_space_free(&config.general.complete_dir),
         disk_space_total: get_disk_space_total(&config.general.complete_dir),
         min_free_space_bytes: qm.min_free_space(),
@@ -1571,6 +1597,9 @@ pub struct UpdateGeneralBody {
     pub watch_dir: Option<String>,
     pub cache_size: Option<u64>,
     pub max_active_downloads: Option<usize>,
+    pub max_post_processing_jobs: Option<usize>,
+    pub max_repair_workers: Option<usize>,
+    pub max_extract_workers: Option<usize>,
     pub history_retention: Option<Option<usize>>,
     pub rss_history_limit: Option<Option<usize>>,
 }
@@ -1605,6 +1634,17 @@ pub async fn h_general_update(
     if let Some(mad) = body.max_active_downloads {
         state.queue_manager.set_max_active_downloads(mad);
         config.general.max_active_downloads = mad;
+    }
+    // Resource pools cannot safely discard live permits. Persist updated
+    // stage limits now and apply them on the next process start.
+    if let Some(max) = body.max_post_processing_jobs {
+        config.general.max_post_processing_jobs = max.max(1);
+    }
+    if let Some(max) = body.max_repair_workers {
+        config.general.max_repair_workers = max.max(1);
+    }
+    if let Some(max) = body.max_extract_workers {
+        config.general.max_extract_workers = max.max(1);
     }
     if let Some(ret) = body.history_retention {
         state.queue_manager.set_history_retention(ret);

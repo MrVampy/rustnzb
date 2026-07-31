@@ -9,6 +9,7 @@
 pub mod detect;
 pub mod par2;
 pub mod pipeline;
+pub mod resources;
 pub mod unpack;
 
 // Re-export nzb-core (and transitively nzb-nntp) so consumers only
@@ -17,5 +18,6 @@ pub use nzb_core;
 
 pub use detect::{ArchiveType, RarVolumeInfo, has_usable_output, parse_rar_volume};
 pub use par2::recovery_can_cover;
-pub use pipeline::{PostProcConfig, PostProcResult, run_pipeline};
+pub use pipeline::{PostProcConfig, PostProcResult, run_pipeline, run_pipeline_with_resources};
+pub use resources::{PostProcLimits, PostProcResourcePool, PostProcResourceSnapshot};
 pub use unpack::find_unrar;

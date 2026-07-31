@@ -10,6 +10,12 @@ cache_size = 524288000  # 500 MB
 log_level = "info"
 # log_file = "data/rustnzb.log"
 # history_retention = 100  # Number of NZBs to keep in history (omit for keep all)
+# Independent post-processing jobs overlap downloads. Separate repair and
+# extraction gates allow those stages to overlap safely across different jobs.
+# These limits are applied at process start.
+max_post_processing_jobs = 2
+max_repair_workers = 1
+max_extract_workers = 1
 direct_unpack = true  # Extract RAR volumes while downloading when unrar is available
 max_nested_archive_depth = 5  # 0=outer archive only; protects against unbounded nesting
 

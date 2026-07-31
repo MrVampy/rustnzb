@@ -17,6 +17,11 @@ use crate::nzb_core::nzb_parser;
 use crate::error::ApiError;
 use crate::state::AppState;
 
+/// SABnzbd release whose public response contract this compatibility layer
+/// targets. Keep this in sync with the conformance fixtures under
+/// `tests/fixtures/sabnzbd-*`.
+const SABNZBD_COMPAT_VERSION: &str = "5.0.4";
+
 /// Arr-compatible API request -- all parameters come as query strings.
 #[derive(Deserialize, Default)]
 pub struct SabApiRequest {
@@ -362,7 +367,7 @@ pub async fn h_sabnzbd_api_post(
 fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serde_json::Value> {
     match mode {
         "version" => Json(serde_json::json!({
-            "version": "4.3.3"
+            "version": SABNZBD_COMPAT_VERSION
         })),
 
         "queue" => handle_queue(state, req),
@@ -386,16 +391,7 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
 
         "priority" => handle_priority(state, req),
 
-        "fullstatus" | "server_stats" => {
-            let qm = &state.queue_manager;
-            Json(serde_json::json!({
-                "status": {
-                    "version": "4.3.3",
-                    "paused": qm.is_paused(),
-                    "speed": format!("{}", qm.get_speed()),
-                }
-            }))
-        }
+        "fullstatus" | "server_stats" => handle_fullstatus(state),
 
         "pause" => handle_pause(state, req),
 
@@ -410,6 +406,84 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
             "error": format!("Unknown mode: {mode}")
         })),
     }
+}
+
+/// Return the stable subset of SABnzbd's full-status dashboard contract.
+///
+/// SAB-compatible clients inspect this response as a capability/status
+/// document, so preserving its keys and JSON types is more important than
+/// inventing measurements RustNZB does not currently collect. Unsupported
+/// dashboard measurements therefore use SABnzbd-compatible empty/zero values.
+fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
+    let config = state.config();
+    let general = &config.general;
+    let qm = &state.queue_manager;
+    let speed_limit = qm.get_speed_limit();
+    let pause_int = qm.pause_remaining_secs().unwrap_or(0).max(0).to_string();
+
+    Json(serde_json::json!({
+        "status": {
+            "active_lang": "en",
+            "active_socks5_proxy": serde_json::Value::Null,
+            "apikey": general.api_key.as_deref().unwrap_or(""),
+            "cache_art": "0",
+            "cache_size": format_size_human(general.cache_size),
+            "color_scheme": "Auto",
+            "completedir": general.complete_dir.to_string_lossy(),
+            "completedirspeed": 0,
+            "configfn": state.config_path.to_string_lossy(),
+            "confighelpuri": "https://sabnzbd.org/wiki/configuration/5.0/",
+            "delayed_assembler": 0,
+            "diskspace1": "0.00",
+            "diskspace1_norm": "0 B",
+            "diskspace2": "0.00",
+            "diskspace2_norm": "0 B",
+            "diskspacetotal1": "0.00",
+            "diskspacetotal2": "0.00",
+            "dnslookup": false,
+            "downloaddir": general.incomplete_dir.to_string_lossy(),
+            "downloaddirspeed": 0,
+            "finishaction": serde_json::Value::Null,
+            "folders": Vec::<String>::new(),
+            "have_quota": false,
+            "have_warnings": "0",
+            "internetbandwidth": 0,
+            "ipv6": serde_json::Value::Null,
+            "left_quota": "0 B",
+            "loadavg": "",
+            "localipv4": serde_json::Value::Null,
+            "logfile": general
+                .log_file
+                .as_ref()
+                .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+            "loglevel": &general.log_level,
+            "macos": cfg!(target_os = "macos"),
+            "my_home": general.data_dir.to_string_lossy(),
+            "my_lcldata": general.data_dir.to_string_lossy(),
+            "new_rel_url": serde_json::Value::Null,
+            "new_release": serde_json::Value::Null,
+            "pause_int": pause_int,
+            "paused": qm.is_paused(),
+            "paused_all": false,
+            "pid": std::process::id(),
+            "power_options": false,
+            "pp_pause_event": false,
+            "publicipv4": serde_json::Value::Null,
+            "pystone": 0,
+            "quota": "0 B",
+            "rtl": false,
+            "servers": Vec::<serde_json::Value>::new(),
+            "speedlimit": if speed_limit == 0 { "0" } else { "100" },
+            "speedlimit_abs": speed_limit.to_string(),
+            "uptime": "0m",
+            "url_base": "",
+            "version": SABNZBD_COMPAT_VERSION,
+            "warnings": Vec::<serde_json::Value>::new(),
+            "webdir": "",
+            "weblogfile": serde_json::Value::Null,
+            "windows": cfg!(target_os = "windows"),
+        }
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -525,11 +599,13 @@ fn build_queue_response(
 
     serde_json::json!({
         "queue": {
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": SABNZBD_COMPAT_VERSION,
             "status": queue_status(paused, speed_bps),
             "paused": paused,
             "pause_int": "0",
-            "paused_all": paused,
+            // SABnzbd uses `paused_all` for a distinct scheduler condition;
+            // the ordinary global pause endpoint only sets `paused`.
+            "paused_all": false,
             "speedlimit": "0",
             "speedlimit_abs": speed_limit_bps.to_string(),
             "speed": format_speed(speed_bps),
@@ -592,8 +668,7 @@ fn queue_status(paused: bool, speed_bps: u64) -> &'static str {
 }
 
 fn queue_totals_include(job: &NzbJob) -> bool {
-    job.priority == Priority::Force
-        || !matches!(job.status, JobStatus::Paused | JobStatus::Verifying)
+    !matches!(job.status, JobStatus::Completed | JobStatus::Failed)
 }
 
 /// Handle mode=queue&name=delete&value=nzo_ID (SABnzbd queue delete)
@@ -750,7 +825,7 @@ fn build_history_response(
             "noofslots": noofslots,
             "ppslots": ppslots,
             "last_history_update": history_update,
-            "version": "4.3.3"
+            "version": SABNZBD_COMPAT_VERSION
         }
     })
 }
@@ -1221,7 +1296,15 @@ impl SabQueueSlot {
             } else {
                 job.category.clone()
             },
-            status: sab_queue_status(job.status).into(),
+            // RustNZB marks queued jobs Paused when the global gate is
+            // applied. SABnzbd preserves their queue-facing `Queued` state
+            // while reporting the gate through the envelope's `paused` key.
+            status: if globally_paused && job.status == JobStatus::Paused {
+                "Queued"
+            } else {
+                sab_queue_status(job.status)
+            }
+            .into(),
             priority: sab_priority_name(job.priority).into(),
             mb: format!("{mb:.2}"),
             mbleft: format!("{mbleft:.2}"),
@@ -1482,6 +1565,77 @@ fn format_timeleft(bytes_left: u64, speed_bps: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    use arc_swap::ArcSwap;
+    use chrono::TimeZone;
+
+    use crate::auth::{CredentialStore, TokenStore};
+    use crate::log_buffer::LogBuffer;
+    use crate::nzb_core::config::AppConfig;
+    use crate::nzb_core::db::Database;
+    use crate::queue_manager::QueueManager;
+
+    mod sab_contract {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/sab_contract.rs"
+        ));
+    }
+
+    const VERSION_GOLDEN: &str = include_str!("../tests/fixtures/sabnzbd-5.0.4/version.json");
+    const QUEUE_GOLDEN: &str = include_str!("../tests/fixtures/sabnzbd-5.0.4/queue.json");
+    const HISTORY_GOLDEN: &str = include_str!("../tests/fixtures/sabnzbd-5.0.4/history.json");
+    const FULLSTATUS_GOLDEN: &str = include_str!("../tests/fixtures/sabnzbd-5.0.4/fullstatus.json");
+
+    struct TestState {
+        state: AppState,
+        _tempdir: tempfile::TempDir,
+    }
+
+    fn test_state() -> TestState {
+        let tempdir = tempfile::tempdir().expect("create SAB conformance tempdir");
+        let mut config = AppConfig::default();
+        config.general.api_key = Some("contract-api-key".into());
+        config.general.data_dir = tempdir.path().join("data");
+        config.general.incomplete_dir = tempdir.path().join("incomplete");
+        config.general.complete_dir = tempdir.path().join("complete");
+        config.general.cache_size = 512 * 1024 * 1024;
+        config.general.speed_limit_bps = 8 * 1024 * 1024;
+
+        let log_buffer = LogBuffer::default();
+        let queue_manager = QueueManager::new(
+            Vec::new(),
+            Database::open_memory().expect("open in-memory conformance database"),
+            config.general.incomplete_dir.clone(),
+            config.general.complete_dir.clone(),
+            log_buffer.clone(),
+            1,
+            Vec::new(),
+            0,
+            config.general.speed_limit_bps,
+            false,
+            5,
+            false,
+            false,
+            100.0,
+            30,
+        );
+        let config_path = tempdir.path().join("sab-conformance.toml");
+        let state = AppState::new(
+            Arc::new(ArcSwap::from_pointee(config)),
+            config_path,
+            queue_manager,
+            log_buffer,
+            Arc::new(TokenStore::new()),
+            Arc::new(CredentialStore::new(tempdir.path().to_path_buf())),
+        );
+
+        TestState {
+            state,
+            _tempdir: tempdir,
+        }
+    }
 
     fn queue_job(id: &str, name: &str, category: &str, status: JobStatus) -> NzbJob {
         NzbJob {
@@ -1672,7 +1826,7 @@ mod tests {
         let response = build_queue_response(&jobs, false, 0, 0, &req);
         let queue = &response["queue"];
 
-        assert_eq!(queue["noofslots_total"], 3);
+        assert_eq!(queue["noofslots_total"], 4);
         assert_eq!(queue["noofslots"], 3);
         assert_eq!(queue["start"], 1);
         assert_eq!(queue["limit"], 1);
@@ -1861,5 +2015,137 @@ mod tests {
             unchanged_history_response(),
             serde_json::json!({ "history": false })
         );
+    }
+
+    #[tokio::test]
+    async fn version_matches_sabnzbd_golden_contract() {
+        let state = test_state();
+        let expected = sab_contract::golden(VERSION_GOLDEN);
+        let actual = dispatch_mode(&state.state, "version", &SabApiRequest::default()).0;
+
+        sab_contract::assert_matches_golden(actual, &expected);
+    }
+
+    #[tokio::test]
+    async fn fullstatus_matches_sabnzbd_golden_contract() {
+        let state = test_state();
+        let expected = sab_contract::golden(FULLSTATUS_GOLDEN);
+        let actual = dispatch_mode(&state.state, "fullstatus", &SabApiRequest::default()).0;
+
+        sab_contract::assert_matches_golden(actual, &expected);
+    }
+
+    #[tokio::test]
+    async fn queue_matches_sabnzbd_golden_contract() {
+        let state = test_state();
+        state.state.queue_manager.pause_all();
+        let added_at = chrono::Utc
+            .timestamp_opt(1_700_000_000, 0)
+            .single()
+            .expect("valid fixture time");
+        let job = NzbJob {
+            id: "contract-queue-job".into(),
+            name: "SAB contract fixture".into(),
+            category: "tv".into(),
+            status: JobStatus::Queued,
+            priority: Priority::Normal,
+            total_bytes: 1_048_576,
+            downloaded_bytes: 0,
+            file_count: 1,
+            files_completed: 0,
+            article_count: 1,
+            articles_downloaded: 0,
+            articles_failed: 0,
+            added_at,
+            completed_at: None,
+            work_dir: state
+                .state
+                .config()
+                .general
+                .incomplete_dir
+                .join("contract-queue-job"),
+            output_dir: state
+                .state
+                .config()
+                .general
+                .complete_dir
+                .join("contract-queue-job"),
+            password: None,
+            error_message: None,
+            speed_bps: 0,
+            server_stats: Vec::new(),
+            files: Vec::new(),
+        };
+        state
+            .state
+            .queue_manager
+            .add_job(job, None)
+            .expect("add queue fixture");
+        let request = SabApiRequest {
+            limit: Some(1),
+            ..SabApiRequest::default()
+        };
+        let actual = dispatch_mode(&state.state, "queue", &request).0;
+
+        sab_contract::assert_matches_golden(actual, &sab_contract::golden(QUEUE_GOLDEN));
+    }
+
+    #[tokio::test]
+    async fn history_matches_sabnzbd_golden_contract() {
+        let state = test_state();
+        let added_at = chrono::Utc
+            .timestamp_opt(1_700_000_000, 0)
+            .single()
+            .expect("valid fixture time");
+        let entry = HistoryEntry {
+            id: "contract-history-job".into(),
+            name: "SAB history fixture".into(),
+            category: "tv".into(),
+            status: JobStatus::Completed,
+            total_bytes: 1_048_576,
+            downloaded_bytes: 1_048_576,
+            added_at,
+            completed_at: added_at + chrono::Duration::seconds(10),
+            download_time_secs: Some(5.0),
+            output_dir: state
+                .state
+                .config()
+                .general
+                .complete_dir
+                .join("contract-history-job"),
+            stages: Vec::new(),
+            error_message: None,
+            server_stats: Vec::new(),
+            nzb_data: None,
+        };
+        state.state.queue_manager.with_db(|database| {
+            database
+                .history_insert(&entry)
+                .expect("insert history fixture")
+        });
+        let request = SabApiRequest {
+            limit: Some(1),
+            ..SabApiRequest::default()
+        };
+        let actual = dispatch_mode(&state.state, "history", &request).0;
+
+        sab_contract::assert_matches_golden(actual, &sab_contract::golden(HISTORY_GOLDEN));
+    }
+
+    #[test]
+    fn checked_in_sabnzbd_goldens_are_valid_json() {
+        let fixture_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sabnzbd-5.0.4");
+
+        for name in [
+            "queue.json",
+            "history.json",
+            "fullstatus.json",
+            "version.json",
+        ] {
+            let contents = std::fs::read_to_string(fixture_dir.join(name))
+                .unwrap_or_else(|error| panic!("read {name}: {error}"));
+            sab_contract::golden(&contents);
+        }
     }
 }

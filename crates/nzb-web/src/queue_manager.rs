@@ -695,6 +695,9 @@ pub struct QueueManager {
     pause_until: Mutex<Option<DateTime<Utc>>>,
     /// History retention limit (None = keep all).
     history_retention: Mutex<Option<usize>>,
+    /// SAB-compatible history generation. Incremented only when the history
+    /// view changes so polling clients can avoid downloading unchanged data.
+    history_update: AtomicU64,
     /// Log buffer for capturing per-job logs into history.
     log_buffer: Option<LogBuffer>,
     /// Broadcast channel: fires immediately when a job is accepted into the queue.
@@ -821,6 +824,7 @@ impl QueueManager {
             complete_dir: Mutex::new(complete_dir),
             pause_until: Mutex::new(None),
             history_retention: Mutex::new(None),
+            history_update: AtomicU64::new(1),
             log_buffer: Some(log_buffer),
             add_tx,
             max_active_downloads: AtomicUsize::new(max_active_downloads),
@@ -864,6 +868,21 @@ impl QueueManager {
     /// Set history retention limit.
     pub fn set_history_retention(&self, limit: Option<usize>) {
         *self.history_retention.lock() = limit;
+    }
+
+    /// Current generation of the SAB-compatible history view.
+    pub fn history_update(&self) -> u64 {
+        self.history_update.load(Ordering::Acquire)
+    }
+
+    fn history_changed(&self) {
+        // SABnzbd also uses a wrapping generation rather than a timestamp.
+        // Keep zero reserved for clients that have never polled.
+        let _ = self
+            .history_update
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(if current == u64::MAX { 1 } else { current + 1 })
+            });
     }
 
     /// Subscribe to job addition events. The receiver fires immediately when
@@ -1699,6 +1718,7 @@ impl QueueManager {
                             state.job.completed_at = Some(chrono::Utc::now());
                         }
                     }
+                    self.history_changed();
                     self.start_next_queued();
 
                     self.on_job_finished(&job_id, success, articles_failed)
@@ -2042,6 +2062,7 @@ impl QueueManager {
                     error!(job_id = %state.job.id, "Failed to insert history: {e}");
                     false
                 } else {
+                    self.history_changed();
                     true
                 }
             }
@@ -2457,10 +2478,13 @@ impl QueueManager {
                 };
                 if let Err(e) = db.history_insert(&history_entry) {
                     error!(job_id = %id, "Failed to insert history for removed failed job: {e}");
-                } else if let Some(max) = *self.history_retention.lock()
-                    && let Err(e) = db.history_enforce_retention(max)
-                {
-                    warn!("Failed to enforce history retention: {e}");
+                } else {
+                    self.history_changed();
+                    if let Some(max) = *self.history_retention.lock()
+                        && let Err(e) = db.history_enforce_retention(max)
+                    {
+                        warn!("Failed to enforce history retention: {e}");
+                    }
                 }
             } else if history_already_persisted {
                 debug!(job_id = %id, "Removing terminal queue view; history already persisted");
@@ -3045,13 +3069,23 @@ impl QueueManager {
     /// Remove a history entry.
     pub fn history_remove(&self, id: &str) -> crate::nzb_core::Result<()> {
         let db = self.db.lock();
-        db.history_remove(id)
+        let existed = db.history_get(id)?.is_some();
+        db.history_remove(id)?;
+        if existed {
+            self.history_changed();
+        }
+        Ok(())
     }
 
     /// Clear all history.
     pub fn history_clear(&self) -> crate::nzb_core::Result<()> {
         let db = self.db.lock();
-        db.history_clear()
+        let had_entries = db.history_count()? != 0;
+        db.history_clear()?;
+        if had_entries {
+            self.history_changed();
+        }
+        Ok(())
     }
 
     /// Get live logs for an active job from the in-memory log buffer.
@@ -3835,6 +3869,34 @@ mod global_pause_tests {
                 .as_deref(),
             Some("original failure")
         );
+        assert_eq!(manager.history_update(), 2);
+    }
+
+    #[tokio::test]
+    async fn history_generation_changes_only_for_real_mutations() {
+        let (manager, tempdir) = manager();
+        assert_eq!(manager.history_update(), 1);
+
+        manager.history_clear().unwrap();
+        manager.history_remove("missing").unwrap();
+        assert_eq!(manager.history_update(), 1);
+
+        insert_job(
+            &manager,
+            job("counter-terminal", JobStatus::Completed, tempdir.path()),
+        );
+        {
+            let mut jobs = manager.jobs.lock();
+            manager.move_to_history(jobs.get_mut("counter-terminal").unwrap(), Vec::new());
+        }
+        assert_eq!(manager.history_update(), 2);
+
+        manager.history_remove("counter-terminal").unwrap();
+        assert_eq!(manager.history_update(), 3);
+
+        manager.history_remove("counter-terminal").unwrap();
+        manager.history_clear().unwrap();
+        assert_eq!(manager.history_update(), 3);
     }
 
     #[tokio::test]

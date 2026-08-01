@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub use nzb_decode;
 pub use nzb_postproc;
 pub use nzb_postproc::nzb_core;

@@ -1,34 +1,29 @@
-//! Reproduction suite for issue #87: obfuscated multi-volume RAR sets named
-//! `<32 hex digits>.NN` are never detected, never extracted, and still let the
-//! job report Completed.
+//! Detection-layer regression suite for issue #87: obfuscated multi-volume RAR
+//! sets named `<32 hex digits>.NN` were never detected, never extracted, and
+//! still let the job report Completed.
 //!
 //! The suite is deliberately paired:
 //!
 //! * `neg_*` — **negative controls**. Conventional naming (`.rar`/`.r00`,
-//!   `.partNNN.rar`, `.7z.001`) and true payload. These pass on `main` and
-//!   prove the detection layer works when the filename carries an extension,
-//!   so a failure in a `pos_*` test is about the *name*, not the plumbing.
-//!   They are also the regression guard: any fix must keep these green.
+//!   `.partNNN.rar`, `.7z.001`) and true payload. These passed before the fix
+//!   as well as after, so a `pos_*` failure is about the *name*, not the
+//!   plumbing. They are the guard against the fix breaking ordinary sets.
 //!
-//! * `pos_*` — **positive reproductions**. The obfuscated `<hash>.NN` set.
-//!   These assert the behaviour we want and therefore FAIL on `main`. They are
-//!   `#[ignore]`d so the committed suite stays green; run them with
-//!   `cargo test -p nzb-postproc --test obfuscated_rar_volumes -- --ignored`.
-//!   The fix removes the `#[ignore]` attributes.
+//! * `pos_*` — the obfuscated `<hash>.NN` set. Each of these failed before the
+//!   fix, one per broken layer.
 //!
 //! * `guard_*` — **false-positive guards**. A naive fix ("treat any numeric
-//!   extension as a RAR volume") would break these. They pass on `main` and
-//!   must stay green.
+//!   extension as a RAR volume") breaks these; they are why detection reads
+//!   the RAR signature instead of trusting the extension.
 //!
-//! Fixtures carry real RAR signature bytes so that a content-sniffing fix has
-//! something valid to sniff.
+//! Fixtures carry real RAR signature bytes because detection now sniffs them.
 
 use std::fs;
 use std::path::Path;
 
 use nzb_postproc::ArchiveType;
 use nzb_postproc::detect::{
-    find_archives, find_cleanup_files, has_usable_output, parse_rar_volume,
+    find_archives, find_cleanup_files, has_usable_output, parse_rar_volume, parse_rar_volume_at,
 };
 
 /// RAR 4.x volume signature.
@@ -73,7 +68,7 @@ fn cleanup_names(dir: &Path) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Negative controls — conventional naming. Green on `main`, must stay green.
+// Negative controls — conventional naming. Must stay green.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -162,7 +157,7 @@ fn neg_real_payload_counts_as_usable_output() {
 }
 
 // ---------------------------------------------------------------------------
-// Positive reproductions — obfuscated `<hash>.NN`. RED on `main` (issue #87).
+// The obfuscated `<hash>.NN` set — each of these failed before the fix.
 // ---------------------------------------------------------------------------
 
 /// Build the obfuscated set from the issue: `<hash>.45`, `.46`, `.47` + par2.
@@ -177,7 +172,6 @@ fn obfuscated_dir() -> tempfile::TempDir {
 }
 
 #[test]
-#[ignore = "reproduces issue #87: <hash>.NN volumes are not detected as a RAR set"]
 fn pos_obfuscated_numeric_volumes_are_detected_as_rar() {
     let dir = obfuscated_dir();
     let archives = rar_archives(dir.path());
@@ -194,7 +188,6 @@ fn pos_obfuscated_numeric_volumes_are_detected_as_rar() {
 }
 
 #[test]
-#[ignore = "reproduces issue #87: has_usable_output treats raw volumes as payload"]
 fn pos_obfuscated_volumes_are_not_usable_output() {
     let dir = obfuscated_dir();
     assert!(
@@ -205,7 +198,6 @@ fn pos_obfuscated_volumes_are_not_usable_output() {
 }
 
 #[test]
-#[ignore = "reproduces issue #87: <hash>.NN volumes are never cleaned up"]
 fn pos_obfuscated_volumes_are_cleanup_candidates() {
     let dir = obfuscated_dir();
     let cleanup = cleanup_names(dir.path());
@@ -219,14 +211,22 @@ fn pos_obfuscated_volumes_are_cleanup_candidates() {
 }
 
 #[test]
-#[ignore = "reproduces issue #87: parse_rar_volume rejects bare numeric extensions"]
 fn pos_obfuscated_volume_numbers_are_parsed() {
-    let parsed =
-        parse_rar_volume(&format!("{HASH}.45")).expect("bare numeric RAR volume should parse");
+    // Name alone cannot distinguish an obfuscated volume from any other file
+    // ending in digits, so numbering is resolved through the content-aware
+    // entry point. `parse_rar_volume` deliberately still rejects these.
+    let dir = obfuscated_dir();
+    assert!(
+        parse_rar_volume(&format!("{HASH}.45")).is_none(),
+        "the name-only parser must not claim bare numeric extensions"
+    );
+
+    let parsed = parse_rar_volume_at(&dir.path().join(format!("{HASH}.45")))
+        .expect("bare numeric RAR volume should parse from disk");
     assert_eq!(parsed.set_name, HASH);
 
-    let next =
-        parse_rar_volume(&format!("{HASH}.46")).expect("bare numeric RAR volume should parse");
+    let next = parse_rar_volume_at(&dir.path().join(format!("{HASH}.46")))
+        .expect("bare numeric RAR volume should parse from disk");
     assert_eq!(
         next.volume_number,
         parsed.volume_number + 1,
@@ -235,7 +235,16 @@ fn pos_obfuscated_volume_numbers_are_parsed() {
 }
 
 #[test]
-#[ignore = "reproduces issue #87: RAR5-signed obfuscated volumes are equally invisible"]
+fn guard_numeric_file_without_signature_is_not_a_volume() {
+    // The content check is what keeps `parse_rar_volume_at` honest.
+    let dir = make_dir(&[("logfile.01", b"2026-08-11 INFO started")]);
+    assert!(
+        parse_rar_volume_at(&dir.path().join("logfile.01")).is_none(),
+        "a numeric-suffixed file with no RAR signature is not a volume"
+    );
+}
+
+#[test]
 fn pos_obfuscated_rar5_volumes_are_detected() {
     let body = rar_volume(RAR5_MAGIC);
     let dir = tempfile::tempdir().unwrap();
@@ -250,7 +259,7 @@ fn pos_obfuscated_rar5_volumes_are_detected() {
 
 // ---------------------------------------------------------------------------
 // False-positive guards — a naive "any numeric extension is a RAR volume" fix
-// breaks these. Green on `main`, must stay green.
+// breaks these. They are why detection sniffs the RAR signature.
 // ---------------------------------------------------------------------------
 
 #[test]

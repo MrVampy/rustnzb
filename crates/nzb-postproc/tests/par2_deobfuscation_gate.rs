@@ -1,22 +1,24 @@
-//! Reproduction suite for the second half of issue #87: the PAR2-guided
-//! deobfuscation that *would* fix obfuscated names never runs on a healthy
+//! Regression suite for the second half of issue #87: the PAR2-guided
+//! deobfuscation that fixes obfuscated names used to be skipped on a healthy
 //! download.
 //!
 //! `rename_to_par2_names` (pipeline.rs) recovers original filenames by matching
 //! each file's first-16K MD5 against the PAR2 metadata — exactly what an
-//! obfuscated `<hash>.NN` set needs. But it is called from inside the verify
-//! branch, and verification is skipped outright when `articles_failed == 0`
-//! ("files are known-good from CRC checks"). So the one mechanism that can
-//! deobfuscate the set only runs when the download was *damaged*.
+//! obfuscated `<hash>.NN` set needs. It used to be called only from inside the
+//! verify branch, and verification is skipped outright when
+//! `articles_failed == 0` ("files are known-good from CRC checks"), so the one
+//! mechanism that can deobfuscate the set only ran when the download was
+//! *damaged*.
 //!
-//! The pairing mirrors `obfuscated_rar_volumes.rs`:
+//! The fix runs the rename whenever the PAR2 index parses, independent of the
+//! verify decision. These tests pin that: the pairing mirrors
+//! `obfuscated_rar_volumes.rs`:
 //!
-//! * `neg_*` — the damaged path, where the rename does run. Green on `main`;
-//!   proves the rename machinery itself works and is the regression guard.
+//! * `neg_*` — the damaged path, where the rename always ran. Passed before
+//!   the fix too; proves the rename machinery itself was never the problem.
 //! * `pos_*` — the healthy path. Same files, same PAR2, only
-//!   `articles_failed` differs. FAILS on `main`; `#[ignore]`d so CI stays
-//!   green. Run with `-- --ignored`; the fix removes the attribute.
-//! * `guard_*` — must not regress when the gate is lifted.
+//!   `articles_failed` differs. This is the test that failed before the fix.
+//! * `guard_*` — the rename must stay targeted now that it runs on every job.
 //!
 //! Extraction and cleanup are disabled throughout so the assertions are about
 //! filenames on disk and nothing else — these tests need no `unrar` binary.
@@ -136,7 +138,7 @@ fn neg_par2_fixture_is_parseable_and_names_the_files() {
 }
 
 // ---------------------------------------------------------------------------
-// Negative control — damaged download. Rename runs. Green on `main`.
+// Negative control — damaged download. The rename always ran here.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -155,11 +157,10 @@ async fn neg_damaged_download_deobfuscates_via_par2() {
 }
 
 // ---------------------------------------------------------------------------
-// Positive reproduction — healthy download. RED on `main` (issue #87).
+// Healthy download — this is the case that failed before the fix.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "reproduces issue #87: PAR2-guided rename is gated behind articles_failed > 0"]
 async fn pos_healthy_download_deobfuscates_via_par2() {
     let dir = job_dir(&obfuscated_names());
 
@@ -169,15 +170,15 @@ async fn pos_healthy_download_deobfuscates_via_par2() {
     assert_eq!(
         names_on_disk(dir.path()),
         CANONICAL.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        "a clean download of an obfuscated post kept its <hash>.NN names: \
-         verification is skipped when articles_failed == 0, and the PAR2 \
-         rename is nested inside that skipped branch, so the set is never \
-         deobfuscated and the Extract stage finds no archives"
+        "a clean download of an obfuscated post kept its <hash>.NN names — the \
+         PAR2-guided rename has been re-gated behind the verify branch, which \
+         articles_failed == 0 skips, so the set is never deobfuscated and the \
+         Extract stage finds no archives (issue #87)"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Guards — must stay green once the gate is lifted.
+// Guards — the rename must stay targeted now that it runs on every job.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

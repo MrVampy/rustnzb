@@ -493,11 +493,18 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
 fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
     let qm = &state.queue_manager;
 
-    // Sub-commands: mode=queue&name=delete|pause|resume&value=nzo_ID
+    // Sub-commands dispatched via mode=queue&name=<cmd>, matching SABnzbd's
+    // real `_api_queue_table` (delete, pause, resume, priority, rename,
+    // purge, change_complete_action). `sort` and `delete_nzf` have no
+    // equivalent capability in RustNZB's queue manager yet.
     match req.name.as_deref() {
         Some("delete") => return handle_queue_delete(state, req),
         Some("pause") => return handle_queue_item_pause(state, req),
         Some("resume") => return handle_queue_item_resume(state, req),
+        Some("priority") => return handle_queue_priority(state, req),
+        Some("rename") => return handle_queue_rename(state, req),
+        Some("purge") => return handle_queue_purge(state),
+        Some("change_complete_action") => return Json(serde_json::json!({ "status": true })),
         _ => {}
     }
 
@@ -748,6 +755,62 @@ fn handle_queue_item_resume(state: &AppState, req: &SabApiRequest) -> Json<serde
         Ok(()) => Json(serde_json::json!({ "status": true })),
         Err(error) => Json(serde_json::json!({ "status": false, "error": error.to_string() })),
     }
+}
+
+/// Handle mode=queue&name=priority&value=nzo_id(s)&value2=priority.
+/// `value` may be a comma-separated list of nzo_ids, matching SABnzbd's
+/// `_api_queue_priority`.
+fn handle_queue_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    let target = req.value.as_deref().unwrap_or("");
+    let priority = req.value2.as_deref().unwrap_or("");
+    if target.is_empty() || priority.is_empty() {
+        return Json(serde_json::json!({
+            "status": false,
+            "error": "Missing value (job id) or value2 (priority)"
+        }));
+    }
+
+    let priority_value = sab_priority_to_priority(priority);
+    let qm = &state.queue_manager;
+    let mut applied = false;
+    for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+        let id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+        if qm.set_job_priority(id, priority_value).is_ok() {
+            applied = true;
+        }
+    }
+
+    Json(serde_json::json!({ "status": applied }))
+}
+
+/// Handle mode=queue&name=rename&value=nzo_id&value2=new_name.
+fn handle_queue_rename(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    let target = req.value.as_deref().unwrap_or("");
+    let new_name = req.value2.as_deref().unwrap_or("");
+    if target.is_empty() || new_name.is_empty() {
+        return Json(serde_json::json!({
+            "status": false,
+            "error": "Missing value (job id) or value2 (new name)"
+        }));
+    }
+
+    let id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
+    match state.queue_manager.rename_job(id, new_name) {
+        Ok(()) => Json(serde_json::json!({ "status": true })),
+        Err(error) => Json(serde_json::json!({ "status": false, "error": error.to_string() })),
+    }
+}
+
+/// Handle mode=queue&name=purge (remove every queued job).
+fn handle_queue_purge(state: &AppState) -> Json<serde_json::Value> {
+    let qm = &state.queue_manager;
+    let jobs = qm.get_jobs();
+    let nzo_ids: Vec<String> = jobs.iter().map(queue_nzo_id).collect();
+    for job in &jobs {
+        let _ = qm.remove_job(&job.id);
+    }
+    tracing::info!(count = nzo_ids.len(), "Queue purged via arr API");
+    Json(serde_json::json!({ "status": !nzo_ids.is_empty(), "nzo_ids": nzo_ids }))
 }
 
 fn handle_history(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
@@ -2147,5 +2210,92 @@ mod tests {
                 .unwrap_or_else(|error| panic!("read {name}: {error}"));
             sab_contract::golden(&contents);
         }
+    }
+
+    fn add_live_job(test_state: &TestState, id: &str) {
+        let job = NzbJob {
+            id: id.into(),
+            name: "Queue Subcommand Fixture".into(),
+            category: "tv".into(),
+            status: JobStatus::Queued,
+            priority: Priority::Normal,
+            total_bytes: 1_048_576,
+            downloaded_bytes: 0,
+            file_count: 1,
+            files_completed: 0,
+            article_count: 1,
+            articles_downloaded: 0,
+            articles_failed: 0,
+            added_at: chrono::Utc::now(),
+            completed_at: None,
+            work_dir: test_state.state.config().general.incomplete_dir.join(id),
+            output_dir: test_state.state.config().general.complete_dir.join(id),
+            password: None,
+            error_message: None,
+            speed_bps: 0,
+            server_stats: Vec::new(),
+            files: Vec::new(),
+        };
+        test_state
+            .state
+            .queue_manager
+            .add_job(job, None)
+            .expect("add live queue fixture");
+    }
+
+    /// SABnzbd's real priority endpoint is `mode=queue&name=priority`, not
+    /// the top-level `mode=priority` this compat layer also accepts.
+    #[tokio::test]
+    async fn queue_priority_subcommand_changes_job_priority() {
+        let test_state = test_state();
+        add_live_job(&test_state, "queue-priority-job");
+
+        let req = SabApiRequest {
+            mode: Some("queue".into()),
+            name: Some("priority".into()),
+            value: Some("queue-priority-job".into()),
+            value2: Some("1".into()),
+            ..SabApiRequest::default()
+        };
+        let response = dispatch_mode(&test_state.state, "queue", &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+
+        let job = test_state
+            .state
+            .queue_manager
+            .get_jobs()
+            .into_iter()
+            .find(|job| job.id == "queue-priority-job")
+            .expect("job still queued");
+        // This test covers routing (does mode=queue&name=priority reach the
+        // queue manager at all?), not the value mapping itself -- that's
+        // covered separately by sab_priority_to_priority's own tests.
+        assert_eq!(job.priority, sab_priority_to_priority("1"));
+    }
+
+    /// SABnzbd's real rename endpoint is `mode=queue&name=rename`.
+    #[tokio::test]
+    async fn queue_rename_subcommand_renames_job() {
+        let test_state = test_state();
+        add_live_job(&test_state, "queue-rename-job");
+
+        let req = SabApiRequest {
+            mode: Some("queue".into()),
+            name: Some("rename".into()),
+            value: Some("queue-rename-job".into()),
+            value2: Some("New Name".into()),
+            ..SabApiRequest::default()
+        };
+        let response = dispatch_mode(&test_state.state, "queue", &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+
+        let job = test_state
+            .state
+            .queue_manager
+            .get_jobs()
+            .into_iter()
+            .find(|job| job.id == "queue-rename-job")
+            .expect("job still queued");
+        assert_eq!(job.name, "New Name");
     }
 }

@@ -1230,10 +1230,13 @@ fn handle_rename(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
 /// Convert arr-protocol priority string to our Priority enum.
 fn sab_priority_to_priority(s: &str) -> Priority {
     match s.trim() {
-        "-100" | "3" => Priority::Force,
-        "2" => Priority::High,
-        "1" => Priority::Normal,
-        "0" => Priority::Low,
+        "-1" => Priority::Low,
+        "0" | "-100" => Priority::Normal,
+        "1" => Priority::High,
+        // SABnzbd's Force (2) and Repair (3) priorities both mean "jump the
+        // queue"; RustNZB has no separate Repair concept, so both map to
+        // our highest priority.
+        "2" | "3" => Priority::Force,
         _ => Priority::Normal,
     }
 }
@@ -2146,6 +2149,35 @@ mod tests {
             let contents = std::fs::read_to_string(fixture_dir.join(name))
                 .unwrap_or_else(|error| panic!("read {name}: {error}"));
             sab_contract::golden(&contents);
+        }
+    }
+
+    /// Numeric priority codes per SABnzbd 5.1.x `sabnzbd/constants.py`:
+    /// FORCE_PRIORITY=2, HIGH_PRIORITY=1, NORMAL_PRIORITY=0, LOW_PRIORITY=-1,
+    /// DEFAULT_PRIORITY=-100 (displayed/treated as Normal), REPAIR_PRIORITY=3.
+    #[test]
+    fn sab_priority_to_priority_matches_upstream_numeric_codes() {
+        assert_eq!(sab_priority_to_priority("-1"), Priority::Low);
+        assert_eq!(sab_priority_to_priority("0"), Priority::Normal);
+        assert_eq!(sab_priority_to_priority("1"), Priority::High);
+        assert_eq!(sab_priority_to_priority("2"), Priority::Force);
+        assert_eq!(sab_priority_to_priority("3"), Priority::Force);
+        assert_eq!(sab_priority_to_priority("-100"), Priority::Normal);
+    }
+
+    /// The numeric codes accepted when *setting* a priority must agree with
+    /// the codes `sab_priority_matches` uses when *filtering* the queue by
+    /// priority -- a prior regression let these two tables diverge silently.
+    #[test]
+    fn sab_priority_to_priority_agrees_with_sab_priority_matches() {
+        for (priority, numeric) in [
+            (Priority::Low, "-1"),
+            (Priority::Normal, "0"),
+            (Priority::High, "1"),
+            (Priority::Force, "2"),
+        ] {
+            assert_eq!(sab_priority_to_priority(numeric), priority);
+            assert!(sab_priority_matches(priority, numeric));
         }
     }
 }

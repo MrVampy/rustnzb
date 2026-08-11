@@ -95,7 +95,11 @@ async fn addfile_applies_category_and_priority_and_reports_them_in_queue() {
         .json()
         .await
         .unwrap();
-    assert_eq!(add_response["status"], serde_json::json!(true), "resp={add_response:?}");
+    assert_eq!(
+        add_response["status"],
+        serde_json::json!(true),
+        "resp={add_response:?}"
+    );
     let nzo_id = add_response["nzo_ids"][0].as_str().unwrap().to_string();
 
     let queue: serde_json::Value = client
@@ -138,7 +142,11 @@ async fn addurl_over_get_fetches_and_applies_category() {
         .json()
         .await
         .unwrap();
-    assert_eq!(add_response["status"], serde_json::json!(true), "resp={add_response:?}");
+    assert_eq!(
+        add_response["status"],
+        serde_json::json!(true),
+        "resp={add_response:?}"
+    );
     let nzo_id = add_response["nzo_ids"][0].as_str().unwrap().to_string();
 
     let queue: serde_json::Value = client

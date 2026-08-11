@@ -198,7 +198,7 @@ pub async fn h_sabnzbd_api_post(
                     if let Some(ref c) = cat
                         && !c.is_empty()
                     {
-                        job.category = c.clone();
+                        job.category = sab_resolve_category(c).to_string();
                     }
                     if let Some(ref p) = priority {
                         job.priority = sab_priority_to_priority(p);
@@ -294,7 +294,7 @@ pub async fn h_sabnzbd_api_post(
                     if let Some(ref c) = cat
                         && !c.is_empty()
                     {
-                        job.category = c.clone();
+                        job.category = sab_resolve_category(c).to_string();
                     }
                     if let Some(ref p) = priority {
                         job.priority = sab_priority_to_priority(p);
@@ -1235,13 +1235,40 @@ fn handle_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Va
     }
 }
 
+/// SABnzbd's `get_cats` reports the default category as the literal
+/// sentinel `"*"`, not a display name -- verified against
+/// `sabnzbd/sabnzbd@5.1.x`, `sabnzbd/api.py::list_cats(default=False)`.
+/// RustNZB's own category model still names that category "Default"
+/// internally, so translate at the API boundary in both directions.
+const SAB_DEFAULT_CATEGORY_SENTINEL: &str = "*";
+
 fn handle_get_cats(state: &AppState) -> Json<serde_json::Value> {
     let config = state.config();
-    let mut cats: Vec<String> = config.categories.iter().map(|c| c.name.clone()).collect();
-    if !cats.iter().any(|c| c == "Default") {
-        cats.insert(0, "Default".into());
+    let mut cats: Vec<String> = config
+        .categories
+        .iter()
+        .map(|c| {
+            if c.name.eq_ignore_ascii_case("Default") {
+                SAB_DEFAULT_CATEGORY_SENTINEL.to_string()
+            } else {
+                c.name.clone()
+            }
+        })
+        .collect();
+    if !cats.iter().any(|c| c == SAB_DEFAULT_CATEGORY_SENTINEL) {
+        cats.insert(0, SAB_DEFAULT_CATEGORY_SENTINEL.into());
     }
     Json(serde_json::json!({ "categories": cats }))
+}
+
+/// Translate a client-supplied category into RustNZB's internal name,
+/// resolving SABnzbd's `"*"` default-category sentinel.
+fn sab_resolve_category(cat: &str) -> &str {
+    if cat == SAB_DEFAULT_CATEGORY_SENTINEL {
+        "Default"
+    } else {
+        cat
+    }
 }
 
 fn handle_change_cat(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
@@ -1258,7 +1285,7 @@ fn handle_change_cat(state: &AppState, req: &SabApiRequest) -> Json<serde_json::
     let search_id = job_id.strip_prefix("SABnzbd_nzo_").unwrap_or(job_id);
 
     let qm = &state.queue_manager;
-    match qm.change_job_category(search_id, new_cat) {
+    match qm.change_job_category(search_id, sab_resolve_category(new_cat)) {
         Ok(()) => Json(serde_json::json!({ "status": true })),
         Err(e) => Json(serde_json::json!({
             "status": false,
@@ -2247,7 +2274,7 @@ mod tests {
     fn add_live_job(test_state: &TestState, id: &str) {
         let job = NzbJob {
             id: id.into(),
-            name: "Queue Subcommand Fixture".into(),
+            name: "Compat Layer Fixture".into(),
             category: "tv".into(),
             status: JobStatus::Queued,
             priority: Priority::Normal,
@@ -2329,5 +2356,45 @@ mod tests {
             .find(|job| job.id == "queue-rename-job")
             .expect("job still queued");
         assert_eq!(job.name, "New Name");
+    }
+
+    /// SABnzbd's real `get_cats` reports the default category as `"*"`, not
+    /// a display name -- verified against `sabnzbd/api.py::list_cats(default=False)`.
+    #[tokio::test]
+    async fn get_cats_reports_default_category_as_sabnzbd_sentinel() {
+        let test_state = test_state();
+        let response = handle_get_cats(&test_state.state).0;
+        let cats = response["categories"]
+            .as_array()
+            .expect("categories array");
+        assert_eq!(cats, &vec![serde_json::json!("*")]);
+    }
+
+    #[tokio::test]
+    async fn change_cat_accepts_sabnzbd_default_sentinel() {
+        let test_state = test_state();
+        add_live_job(&test_state, "sentinel-cat-job");
+        test_state
+            .state
+            .queue_manager
+            .change_job_category("sentinel-cat-job", "movies")
+            .expect("seed non-default category");
+
+        let req = SabApiRequest {
+            value: Some("sentinel-cat-job".into()),
+            value2: Some("*".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_change_cat(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+
+        let job = test_state
+            .state
+            .queue_manager
+            .get_jobs()
+            .into_iter()
+            .find(|job| job.id == "sentinel-cat-job")
+            .expect("job still queued");
+        assert_eq!(job.category, "Default");
     }
 }

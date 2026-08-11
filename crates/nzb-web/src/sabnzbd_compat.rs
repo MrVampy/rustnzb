@@ -43,6 +43,7 @@ pub struct SabApiRequest {
     pub archive: Option<String>,
     pub last_history_update: Option<u64>,
     pub password: Option<String>,
+    pub del_files: Option<String>,
 }
 
 /// Validate API key. Returns Err with JSON response on failure.
@@ -337,8 +338,12 @@ pub async fn h_sabnzbd_api_post(
             let req = SabApiRequest {
                 mode: Some(mode),
                 name,
-                value: None,
-                value2: None,
+                // Sub-commands like queue/history delete, priority, and
+                // rename take `value`/`value2` as plain query-string
+                // parameters even on POST -- these were previously dropped
+                // here, silently breaking those actions over POST.
+                value: query_req.value,
+                value2: query_req.value2,
                 apikey,
                 output: None,
                 cat,
@@ -353,6 +358,7 @@ pub async fn h_sabnzbd_api_post(
                 archive: query_req.archive,
                 last_history_update: query_req.last_history_update,
                 password,
+                del_files: query_req.del_files,
             };
             Ok(dispatch_mode(
                 &state,
@@ -684,7 +690,11 @@ fn queue_totals_include(job: &NzbJob) -> bool {
     !matches!(job.status, JobStatus::Completed | JobStatus::Failed)
 }
 
-/// Handle mode=queue&name=delete&value=nzo_ID (SABnzbd queue delete)
+/// Handle mode=queue&name=delete&value=nzo_id(s) (SABnzbd queue delete).
+/// `value` may be a comma-separated list of nzo_ids, matching SABnzbd's
+/// `_api_queue_delete`. RustNZB's `remove_job` already always cleans up a
+/// job's incomplete work directory, so `del_files` (unlike in history
+/// delete) doesn't change queue-delete behavior here.
 fn handle_queue_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
     let target = req.value.as_deref().unwrap_or("");
     if target.is_empty() {
@@ -694,7 +704,7 @@ fn handle_queue_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json
     let qm = &state.queue_manager;
 
     // "all" removes everything from the queue
-    if target == "all" {
+    if target.eq_ignore_ascii_case("all") {
         let jobs = qm.get_jobs();
         for job in &jobs {
             let _ = qm.remove_job(&job.id);
@@ -706,19 +716,21 @@ fn handle_queue_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json
         return Json(serde_json::json!({ "status": true }));
     }
 
-    // Strip SABnzbd prefix and match by ID prefix
-    let search_id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
     let jobs = qm.get_jobs();
-    for job in &jobs {
-        if job.id == search_id || job.id.starts_with(search_id) {
+    let mut removed_ids: Vec<String> = Vec::new();
+    for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+        let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+        if let Some(job) = jobs
+            .iter()
+            .find(|job| job.id == search_id || job.id.starts_with(search_id))
+        {
             let _ = qm.remove_job(&job.id);
             tracing::info!(id = %job.id, "Job removed from queue via arr API (mode=queue)");
-            return Json(serde_json::json!({ "status": true }));
+            removed_ids.push(queue_nzo_id(job));
         }
     }
 
-    tracing::warn!(search = %search_id, "Queue delete: job not found");
-    Json(serde_json::json!({ "status": false }))
+    Json(serde_json::json!({ "status": !removed_ids.is_empty(), "nzo_ids": removed_ids }))
 }
 
 /// Handle mode=queue&name=pause&value=nzo_ID.
@@ -970,6 +982,10 @@ fn sab_query_bool(value: &str) -> bool {
 }
 
 /// Handle mode=history&name=delete&value=nzo_ID (SABnzbd history delete)
+/// `value` may be a comma-separated list of nzo_ids, matching SABnzbd's
+/// `_api_history_delete`. `del_files=1` additionally removes the entry's
+/// completed output directory from disk, matching real SABnzbd -- RustNZB
+/// otherwise never frees that space on history delete.
 fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
     let target = req.value.as_deref().unwrap_or("");
     if target.is_empty() {
@@ -977,8 +993,14 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
     }
 
     let qm = &state.queue_manager;
+    let del_files = req.del_files.as_deref().is_some_and(sab_query_bool);
 
-    if target == "all" {
+    if target.eq_ignore_ascii_case("all") {
+        if del_files {
+            for entry in qm.history_list(i64::MAX as usize).unwrap_or_default() {
+                let _ = std::fs::remove_dir_all(&entry.output_dir);
+            }
+        }
         return match qm.history_clear() {
             Ok(()) => Json(serde_json::json!({ "status": true })),
             Err(error) => Json(serde_json::json!({
@@ -988,18 +1010,24 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
         };
     }
 
-    let search_id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
-    let entries = qm.history_list(1000).unwrap_or_default();
-    for entry in &entries {
-        if entry.id == search_id || entry.id.starts_with(search_id) {
+    let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
+    let mut removed_ids: Vec<String> = Vec::new();
+    for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+        let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.id == search_id || entry.id.starts_with(search_id))
+        {
+            if del_files {
+                let _ = std::fs::remove_dir_all(&entry.output_dir);
+            }
             let _ = qm.history_remove(&entry.id);
             tracing::info!(id = %entry.id, "Entry removed from history via arr API (mode=history)");
-            return Json(serde_json::json!({ "status": true }));
+            removed_ids.push(entry.id.clone());
         }
     }
 
-    tracing::warn!(search = %search_id, "History delete: entry not found");
-    Json(serde_json::json!({ "status": false }))
+    Json(serde_json::json!({ "status": !removed_ids.is_empty() }))
 }
 
 fn handle_get_config(state: &AppState) -> Json<serde_json::Value> {
@@ -2415,5 +2443,101 @@ mod tests {
         let req = SabApiRequest::default();
         let response = dispatch_mode(&test_state.state, "get_scripts", &req).0;
         assert_eq!(response["scripts"], serde_json::json!(["None"]));
+    }
+
+    /// SABnzbd's real `_api_queue_delete` accepts a comma-separated `value`
+    /// list, removing every matching job in one call.
+    #[tokio::test]
+    async fn queue_delete_removes_multiple_comma_separated_ids() {
+        let test_state = test_state();
+        add_live_job(&test_state, "multi-delete-one");
+        add_live_job(&test_state, "multi-delete-two");
+
+        let req = SabApiRequest {
+            value: Some("multi-delete-one,multi-delete-two".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_queue_delete(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+
+        let remaining = test_state.state.queue_manager.get_jobs();
+        assert!(
+            remaining
+                .iter()
+                .all(|job| job.id != "multi-delete-one" && job.id != "multi-delete-two")
+        );
+    }
+
+    fn insert_history_fixture(test_state: &TestState, id: &str, output_dir: std::path::PathBuf) {
+        let entry = HistoryEntry {
+            id: id.into(),
+            name: id.into(),
+            category: "tv".into(),
+            status: JobStatus::Completed,
+            total_bytes: 10_000,
+            downloaded_bytes: 10_000,
+            added_at: chrono::Utc::now() - chrono::Duration::seconds(20),
+            completed_at: chrono::Utc::now(),
+            download_time_secs: Some(1.0),
+            output_dir,
+            stages: Vec::new(),
+            error_message: None,
+            server_stats: Vec::new(),
+            nzb_data: None,
+        };
+        test_state.state.queue_manager.with_db(|database| {
+            database
+                .history_insert(&entry)
+                .expect("insert history fixture")
+        });
+    }
+
+    /// Real SABnzbd's `_api_history_delete` removes the completed output
+    /// directory from disk when `del_files=1` is set; RustNZB previously
+    /// never freed that space regardless of the flag.
+    #[tokio::test]
+    async fn history_delete_with_del_files_removes_output_directory() {
+        let test_state = test_state();
+        let output_dir = test_state
+            .state
+            .config()
+            .general
+            .complete_dir
+            .join("del-files-job");
+        std::fs::create_dir_all(&output_dir).expect("create fixture output dir");
+        std::fs::write(output_dir.join("file.mkv"), b"data").expect("write fixture file");
+        insert_history_fixture(&test_state, "del-files-job", output_dir.clone());
+
+        let req = SabApiRequest {
+            value: Some("del-files-job".into()),
+            del_files: Some("1".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_history_delete(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert!(!output_dir.exists());
+    }
+
+    /// Without `del_files`, history delete only removes the DB record, as
+    /// before.
+    #[tokio::test]
+    async fn history_delete_without_del_files_keeps_output_directory() {
+        let test_state = test_state();
+        let output_dir = test_state
+            .state
+            .config()
+            .general
+            .complete_dir
+            .join("keep-files-job");
+        std::fs::create_dir_all(&output_dir).expect("create fixture output dir");
+        insert_history_fixture(&test_state, "keep-files-job", output_dir.clone());
+
+        let req = SabApiRequest {
+            value: Some("keep-files-job".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_history_delete(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert!(output_dir.exists());
     }
 }

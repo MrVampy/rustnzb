@@ -790,10 +790,18 @@ fn handle_queue_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_js
 
     let priority_value = sab_priority_to_priority(priority);
     let qm = &state.queue_manager;
+    // set_job_priority requires an exact job-id match, but clients only ever
+    // know the truncated SABnzbd_nzo_<12 chars> form -- resolve the full id
+    // by prefix first, the same way pause/resume/rename/change_cat do.
+    let jobs = qm.get_jobs();
     let mut applied = false;
     for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
-        let id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
-        if qm.set_job_priority(id, priority_value).is_ok() {
+        let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+        if let Some(job) = jobs
+            .iter()
+            .find(|job| job.id == search_id || job.id.starts_with(search_id))
+            && qm.set_job_priority(&job.id, priority_value).is_ok()
+        {
             applied = true;
         }
     }
@@ -1259,11 +1267,16 @@ fn handle_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Va
         }));
     }
 
-    let id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
-    match state
-        .queue_manager
-        .set_job_priority(id, sab_priority_to_priority(priority))
-    {
+    let search_id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
+    let qm = &state.queue_manager;
+    let Some(job) = qm
+        .get_jobs()
+        .into_iter()
+        .find(|job| job.id == search_id || job.id.starts_with(search_id))
+    else {
+        return Json(serde_json::json!({ "status": false, "error": "Job not found" }));
+    };
+    match qm.set_job_priority(&job.id, sab_priority_to_priority(priority)) {
         Ok(()) => Json(serde_json::json!({ "status": true })),
         Err(error) => Json(serde_json::json!({ "status": false, "error": error.to_string() })),
     }

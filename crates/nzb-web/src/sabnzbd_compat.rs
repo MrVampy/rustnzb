@@ -1181,27 +1181,29 @@ fn handle_get_cats(state: &AppState) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "categories": cats }))
 }
 
+/// `value` may be a comma-separated list of nzo_ids, matching SABnzbd's
+/// `_api_change_cat` (`nzo_ids = clean_comma_separated_list(kwargs.get("value"))`).
 fn handle_change_cat(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
-    let job_id = req.value.as_deref().unwrap_or("");
+    let job_ids = req.value.as_deref().unwrap_or("");
     let new_cat = req.value2.as_deref().unwrap_or("");
 
-    if job_id.is_empty() || new_cat.is_empty() {
+    if job_ids.is_empty() || new_cat.is_empty() {
         return Json(serde_json::json!({
             "status": false,
             "error": "Missing value (job id) or value2 (category)"
         }));
     }
 
-    let search_id = job_id.strip_prefix("SABnzbd_nzo_").unwrap_or(job_id);
-
     let qm = &state.queue_manager;
-    match qm.change_job_category(search_id, new_cat) {
-        Ok(()) => Json(serde_json::json!({ "status": true })),
-        Err(e) => Json(serde_json::json!({
-            "status": false,
-            "error": format!("{e}")
-        })),
+    let mut changed = false;
+    for raw_id in job_ids.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+        let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+        if qm.change_job_category(search_id, new_cat).is_ok() {
+            changed = true;
+        }
     }
+
+    Json(serde_json::json!({ "status": changed }))
 }
 
 fn handle_rename(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
@@ -2146,6 +2148,63 @@ mod tests {
             let contents = std::fs::read_to_string(fixture_dir.join(name))
                 .unwrap_or_else(|error| panic!("read {name}: {error}"));
             sab_contract::golden(&contents);
+        }
+    }
+
+    fn add_live_job(test_state: &TestState, id: &str, category: &str) {
+        let job = NzbJob {
+            id: id.into(),
+            name: "Change Cat Fixture".into(),
+            category: category.into(),
+            status: JobStatus::Queued,
+            priority: Priority::Normal,
+            total_bytes: 1_048_576,
+            downloaded_bytes: 0,
+            file_count: 1,
+            files_completed: 0,
+            article_count: 1,
+            articles_downloaded: 0,
+            articles_failed: 0,
+            added_at: chrono::Utc::now(),
+            completed_at: None,
+            work_dir: test_state.state.config().general.incomplete_dir.join(id),
+            output_dir: test_state.state.config().general.complete_dir.join(id),
+            password: None,
+            error_message: None,
+            speed_bps: 0,
+            server_stats: Vec::new(),
+            files: Vec::new(),
+        };
+        test_state
+            .state
+            .queue_manager
+            .add_job(job, None)
+            .expect("add live queue fixture");
+    }
+
+    /// SABnzbd's real `_api_change_cat` accepts a comma-separated `value`
+    /// list, applying the category change to every matching job.
+    #[tokio::test]
+    async fn change_cat_applies_to_multiple_comma_separated_ids() {
+        let test_state = test_state();
+        add_live_job(&test_state, "multi-cat-one", "tv");
+        add_live_job(&test_state, "multi-cat-two", "tv");
+
+        let req = SabApiRequest {
+            value: Some("multi-cat-one,multi-cat-two".into()),
+            value2: Some("movies".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_change_cat(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+
+        let jobs = test_state.state.queue_manager.get_jobs();
+        for id in ["multi-cat-one", "multi-cat-two"] {
+            let job = jobs
+                .iter()
+                .find(|job| job.id == id)
+                .unwrap_or_else(|| panic!("job {id} still queued"));
+            assert_eq!(job.category, "movies");
         }
     }
 }

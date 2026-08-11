@@ -43,6 +43,7 @@ pub struct SabApiRequest {
     pub archive: Option<String>,
     pub last_history_update: Option<u64>,
     pub password: Option<String>,
+    pub del_files: Option<String>,
 }
 
 /// Validate API key. Returns Err with JSON response on failure.
@@ -73,8 +74,130 @@ pub async fn h_sabnzbd_api_get(
     }
 
     let mode = req.mode.as_deref().unwrap_or("");
+
+    // `addurl` fetches a remote NZB and has no file body to upload, so real
+    // SABnzbd (and clients like NZB360/Sonarr/Radarr) issue it as a plain
+    // GET rather than a multipart POST. Route it to the same URL-fetching
+    // logic the POST handler uses so `cat`/`priority` are honored here too.
+    if mode == "addurl" {
+        let url = req.name.clone().or_else(|| req.value.clone());
+        return handle_addurl(
+            &state,
+            url,
+            req.name.clone(),
+            req.cat.clone(),
+            req.priority.clone(),
+            req.password.clone(),
+        )
+        .await;
+    }
+
     let result = dispatch_mode(&state, mode, &req);
     Ok(result)
+}
+
+/// Fetch an NZB from a URL and enqueue it, applying category/priority/password
+/// overrides. Shared by the GET and POST `addurl` entry points.
+async fn handle_addurl(
+    state: &AppState,
+    url: Option<String>,
+    name: Option<String>,
+    cat: Option<String>,
+    priority: Option<String>,
+    password: Option<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let url = url.unwrap_or_default();
+
+    if url.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "status": false,
+            "error": "No URL provided"
+        })));
+    }
+
+    tracing::info!(url = %url, "Fetching NZB from URL via arr API");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| ApiError::from(anyhow::anyhow!("HTTP client error: {e}")))?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to fetch URL: {e}")))?;
+
+    if !response.status().is_success() {
+        return Ok(Json(serde_json::json!({
+            "status": false,
+            "error": format!("URL returned HTTP {}", response.status())
+        })));
+    }
+
+    let data = response
+        .bytes()
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to read response: {e}")))?;
+
+    // Derive job name from URL filename if not provided
+    let job_name = name.unwrap_or_else(|| {
+        url.rsplit('/')
+            .next()
+            .and_then(|s| s.split('?').next())
+            .unwrap_or("unknown")
+            .strip_suffix(".nzb")
+            .unwrap_or(
+                url.rsplit('/')
+                    .next()
+                    .and_then(|s| s.split('?').next())
+                    .unwrap_or("unknown"),
+            )
+            .to_string()
+    });
+
+    match nzb_parser::parse_nzb(&job_name, &data) {
+        Ok(mut job) => {
+            if let Some(ref c) = cat
+                && !c.is_empty()
+            {
+                job.category = sab_resolve_category(c).to_string();
+            }
+            if let Some(ref p) = priority {
+                job.priority = sab_priority_to_priority(p);
+            }
+
+            // API-provided password overrides NZB metadata password
+            if let Some(ref pw) = password {
+                job.password = Some(pw.clone());
+            }
+
+            let qm = &state.queue_manager;
+            job.work_dir = qm.incomplete_dir().join(&job.id);
+            job.output_dir = qm.complete_dir().join(&job.category).join(&job.name);
+
+            let nzo_id = format!("SABnzbd_nzo_{}", &job.id[..12.min(job.id.len())]);
+
+            tracing::info!(
+                name = %job.name,
+                id = %job.id,
+                files = job.file_count,
+                "NZB added to queue via URL (arr API)"
+            );
+
+            let nzb_bytes = data.to_vec();
+            qm.add_job(job, Some(nzb_bytes)).map_err(ApiError::from)?;
+
+            Ok(Json(serde_json::json!({
+                "status": true,
+                "nzo_ids": [nzo_id]
+            })))
+        }
+        Err(e) => Ok(Json(serde_json::json!({
+            "status": false,
+            "error": format!("Failed to parse NZB: {e}")
+        }))),
+    }
 }
 
 /// POST /sabnzbd/api -- Handle POST requests (addfile multipart, or form-encoded).
@@ -198,7 +321,7 @@ pub async fn h_sabnzbd_api_post(
                     if let Some(ref c) = cat
                         && !c.is_empty()
                     {
-                        job.category = c.clone();
+                        job.category = sab_resolve_category(c).to_string();
                     }
                     if let Some(ref p) = priority {
                         job.priority = sab_priority_to_priority(p);
@@ -238,107 +361,20 @@ pub async fn h_sabnzbd_api_post(
         }
 
         "addurl" => {
-            let url = nzb_url.or(name.clone()).unwrap_or_default();
-
-            if url.is_empty() {
-                return Ok(Json(serde_json::json!({
-                    "status": false,
-                    "error": "No URL provided"
-                })));
-            }
-
-            tracing::info!(url = %url, "Fetching NZB from URL via arr API");
-
-            // Fetch the NZB from the URL
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .map_err(|e| ApiError::from(anyhow::anyhow!("HTTP client error: {e}")))?;
-
-            let response = client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to fetch URL: {e}")))?;
-
-            if !response.status().is_success() {
-                return Ok(Json(serde_json::json!({
-                    "status": false,
-                    "error": format!("URL returned HTTP {}", response.status())
-                })));
-            }
-
-            let data = response
-                .bytes()
-                .await
-                .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to read response: {e}")))?;
-
-            // Derive job name from URL filename if not provided
-            let job_name = name.clone().unwrap_or_else(|| {
-                url.rsplit('/')
-                    .next()
-                    .and_then(|s| s.split('?').next())
-                    .unwrap_or("unknown")
-                    .strip_suffix(".nzb")
-                    .unwrap_or(
-                        url.rsplit('/')
-                            .next()
-                            .and_then(|s| s.split('?').next())
-                            .unwrap_or("unknown"),
-                    )
-                    .to_string()
-            });
-
-            match nzb_parser::parse_nzb(&job_name, &data) {
-                Ok(mut job) => {
-                    if let Some(ref c) = cat
-                        && !c.is_empty()
-                    {
-                        job.category = c.clone();
-                    }
-                    if let Some(ref p) = priority {
-                        job.priority = sab_priority_to_priority(p);
-                    }
-
-                    // API-provided password overrides NZB metadata password
-                    if let Some(ref pw) = password {
-                        job.password = Some(pw.clone());
-                    }
-
-                    let qm = &state.queue_manager;
-                    job.work_dir = qm.incomplete_dir().join(&job.id);
-                    job.output_dir = qm.complete_dir().join(&job.category).join(&job.name);
-
-                    let nzo_id = format!("SABnzbd_nzo_{}", &job.id[..12.min(job.id.len())]);
-
-                    tracing::info!(
-                        name = %job.name,
-                        id = %job.id,
-                        files = job.file_count,
-                        "NZB added to queue via URL (arr API)"
-                    );
-
-                    let nzb_bytes = data.to_vec();
-                    qm.add_job(job, Some(nzb_bytes)).map_err(ApiError::from)?;
-
-                    Ok(Json(serde_json::json!({
-                        "status": true,
-                        "nzo_ids": [nzo_id]
-                    })))
-                }
-                Err(e) => Ok(Json(serde_json::json!({
-                    "status": false,
-                    "error": format!("Failed to parse NZB: {e}")
-                }))),
-            }
+            let url = nzb_url.or_else(|| name.clone());
+            handle_addurl(&state, url, name, cat, priority, password).await
         }
 
         _ => {
             let req = SabApiRequest {
                 mode: Some(mode),
                 name,
-                value: None,
-                value2: None,
+                // Sub-commands like queue/history delete, priority, and
+                // rename take `value`/`value2` as plain query-string
+                // parameters even on POST -- these were previously dropped
+                // here, silently breaking those actions over POST.
+                value: query_req.value,
+                value2: query_req.value2,
                 apikey,
                 output: None,
                 cat,
@@ -353,6 +389,7 @@ pub async fn h_sabnzbd_api_post(
                 archive: query_req.archive,
                 last_history_update: query_req.last_history_update,
                 password,
+                del_files: query_req.del_files,
             };
             Ok(dispatch_mode(
                 &state,
@@ -377,6 +414,12 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
         "get_config" | "config" => handle_get_config(state),
 
         "get_cats" => handle_get_cats(state),
+
+        // RustNZB doesn't support post-processing scripts, so this is the
+        // permanent, correct response -- it matches what real SABnzbd
+        // reports when no script directory / scripts are configured
+        // (sabnzbd/api.py::_api_get_scripts -> filesystem.py::list_scripts).
+        "get_scripts" => Json(serde_json::json!({ "scripts": ["None"] })),
 
         "change_cat" => handle_change_cat(state, req),
 
@@ -493,11 +536,18 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
 fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
     let qm = &state.queue_manager;
 
-    // Sub-commands: mode=queue&name=delete|pause|resume&value=nzo_ID
+    // Sub-commands dispatched via mode=queue&name=<cmd>, matching SABnzbd's
+    // real `_api_queue_table` (delete, pause, resume, priority, rename,
+    // purge, change_complete_action). `sort` and `delete_nzf` have no
+    // equivalent capability in RustNZB's queue manager yet.
     match req.name.as_deref() {
         Some("delete") => return handle_queue_delete(state, req),
         Some("pause") => return handle_queue_item_pause(state, req),
         Some("resume") => return handle_queue_item_resume(state, req),
+        Some("priority") => return handle_queue_priority(state, req),
+        Some("rename") => return handle_queue_rename(state, req),
+        Some("purge") => return handle_queue_purge(state),
+        Some("change_complete_action") => return Json(serde_json::json!({ "status": true })),
         _ => {}
     }
 
@@ -671,7 +721,11 @@ fn queue_totals_include(job: &NzbJob) -> bool {
     !matches!(job.status, JobStatus::Completed | JobStatus::Failed)
 }
 
-/// Handle mode=queue&name=delete&value=nzo_ID (SABnzbd queue delete)
+/// Handle mode=queue&name=delete&value=nzo_id(s) (SABnzbd queue delete).
+/// `value` may be a comma-separated list of nzo_ids, matching SABnzbd's
+/// `_api_queue_delete`. RustNZB's `remove_job` already always cleans up a
+/// job's incomplete work directory, so `del_files` (unlike in history
+/// delete) doesn't change queue-delete behavior here.
 fn handle_queue_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
     let target = req.value.as_deref().unwrap_or("");
     if target.is_empty() {
@@ -681,7 +735,7 @@ fn handle_queue_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json
     let qm = &state.queue_manager;
 
     // "all" removes everything from the queue
-    if target == "all" {
+    if target.eq_ignore_ascii_case("all") {
         let jobs = qm.get_jobs();
         for job in &jobs {
             let _ = qm.remove_job(&job.id);
@@ -693,19 +747,21 @@ fn handle_queue_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json
         return Json(serde_json::json!({ "status": true }));
     }
 
-    // Strip SABnzbd prefix and match by ID prefix
-    let search_id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
     let jobs = qm.get_jobs();
-    for job in &jobs {
-        if job.id == search_id || job.id.starts_with(search_id) {
+    let mut removed_ids: Vec<String> = Vec::new();
+    for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+        let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+        if let Some(job) = jobs
+            .iter()
+            .find(|job| job.id == search_id || job.id.starts_with(search_id))
+        {
             let _ = qm.remove_job(&job.id);
             tracing::info!(id = %job.id, "Job removed from queue via arr API (mode=queue)");
-            return Json(serde_json::json!({ "status": true }));
+            removed_ids.push(queue_nzo_id(job));
         }
     }
 
-    tracing::warn!(search = %search_id, "Queue delete: job not found");
-    Json(serde_json::json!({ "status": false }))
+    Json(serde_json::json!({ "status": !removed_ids.is_empty(), "nzo_ids": removed_ids }))
 }
 
 /// Handle mode=queue&name=pause&value=nzo_ID.
@@ -748,6 +804,70 @@ fn handle_queue_item_resume(state: &AppState, req: &SabApiRequest) -> Json<serde
         Ok(()) => Json(serde_json::json!({ "status": true })),
         Err(error) => Json(serde_json::json!({ "status": false, "error": error.to_string() })),
     }
+}
+
+/// Handle mode=queue&name=priority&value=nzo_id(s)&value2=priority.
+/// `value` may be a comma-separated list of nzo_ids, matching SABnzbd's
+/// `_api_queue_priority`.
+fn handle_queue_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    let target = req.value.as_deref().unwrap_or("");
+    let priority = req.value2.as_deref().unwrap_or("");
+    if target.is_empty() || priority.is_empty() {
+        return Json(serde_json::json!({
+            "status": false,
+            "error": "Missing value (job id) or value2 (priority)"
+        }));
+    }
+
+    let priority_value = sab_priority_to_priority(priority);
+    let qm = &state.queue_manager;
+    // set_job_priority requires an exact job-id match, but clients only ever
+    // know the truncated SABnzbd_nzo_<12 chars> form -- resolve the full id
+    // by prefix first, the same way pause/resume/rename/change_cat do.
+    let jobs = qm.get_jobs();
+    let mut applied = false;
+    for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+        let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+        if let Some(job) = jobs
+            .iter()
+            .find(|job| job.id == search_id || job.id.starts_with(search_id))
+            && qm.set_job_priority(&job.id, priority_value).is_ok()
+        {
+            applied = true;
+        }
+    }
+
+    Json(serde_json::json!({ "status": applied }))
+}
+
+/// Handle mode=queue&name=rename&value=nzo_id&value2=new_name.
+fn handle_queue_rename(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    let target = req.value.as_deref().unwrap_or("");
+    let new_name = req.value2.as_deref().unwrap_or("");
+    if target.is_empty() || new_name.is_empty() {
+        return Json(serde_json::json!({
+            "status": false,
+            "error": "Missing value (job id) or value2 (new name)"
+        }));
+    }
+
+    let id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
+    match state.queue_manager.rename_job(id, new_name) {
+        Ok(()) => Json(serde_json::json!({ "status": true })),
+        Err(error) => Json(serde_json::json!({ "status": false, "error": error.to_string() })),
+    }
+}
+
+/// Handle mode=queue&name=purge (remove every queued job).
+fn handle_queue_purge(state: &AppState) -> Json<serde_json::Value> {
+    let qm = &state.queue_manager;
+    let jobs = qm.get_jobs();
+    let nzo_ids: Vec<String> = jobs.iter().map(queue_nzo_id).collect();
+    for job in &jobs {
+        let _ = qm.remove_job(&job.id);
+    }
+    tracing::info!(count = nzo_ids.len(), "Queue purged via arr API");
+    Json(serde_json::json!({ "status": !nzo_ids.is_empty(), "nzo_ids": nzo_ids }))
 }
 
 fn handle_history(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
@@ -901,6 +1021,10 @@ fn sab_query_bool(value: &str) -> bool {
 }
 
 /// Handle mode=history&name=delete&value=nzo_ID (SABnzbd history delete)
+/// `value` may be a comma-separated list of nzo_ids, matching SABnzbd's
+/// `_api_history_delete`. `del_files=1` additionally removes the entry's
+/// completed output directory from disk, matching real SABnzbd -- RustNZB
+/// otherwise never frees that space on history delete.
 fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
     let target = req.value.as_deref().unwrap_or("");
     if target.is_empty() {
@@ -908,8 +1032,14 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
     }
 
     let qm = &state.queue_manager;
+    let del_files = req.del_files.as_deref().is_some_and(sab_query_bool);
 
-    if target == "all" {
+    if target.eq_ignore_ascii_case("all") {
+        if del_files {
+            for entry in qm.history_list(i64::MAX as usize).unwrap_or_default() {
+                let _ = std::fs::remove_dir_all(&entry.output_dir);
+            }
+        }
         return match qm.history_clear() {
             Ok(()) => Json(serde_json::json!({ "status": true })),
             Err(error) => Json(serde_json::json!({
@@ -919,18 +1049,24 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
         };
     }
 
-    let search_id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
-    let entries = qm.history_list(1000).unwrap_or_default();
-    for entry in &entries {
-        if entry.id == search_id || entry.id.starts_with(search_id) {
+    let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
+    let mut removed_ids: Vec<String> = Vec::new();
+    for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+        let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.id == search_id || entry.id.starts_with(search_id))
+        {
+            if del_files {
+                let _ = std::fs::remove_dir_all(&entry.output_dir);
+            }
             let _ = qm.history_remove(&entry.id);
             tracing::info!(id = %entry.id, "Entry removed from history via arr API (mode=history)");
-            return Json(serde_json::json!({ "status": true }));
+            removed_ids.push(entry.id.clone());
         }
     }
 
-    tracing::warn!(search = %search_id, "History delete: entry not found");
-    Json(serde_json::json!({ "status": false }))
+    Json(serde_json::json!({ "status": !removed_ids.is_empty() }))
 }
 
 fn handle_get_config(state: &AppState) -> Json<serde_json::Value> {
@@ -1162,46 +1298,85 @@ fn handle_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Va
         }));
     }
 
-    let id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
-    match state
-        .queue_manager
-        .set_job_priority(id, sab_priority_to_priority(priority))
-    {
+    let search_id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
+    let qm = &state.queue_manager;
+    let Some(job) = qm
+        .get_jobs()
+        .into_iter()
+        .find(|job| job.id == search_id || job.id.starts_with(search_id))
+    else {
+        return Json(serde_json::json!({ "status": false, "error": "Job not found" }));
+    };
+    match qm.set_job_priority(&job.id, sab_priority_to_priority(priority)) {
         Ok(()) => Json(serde_json::json!({ "status": true })),
         Err(error) => Json(serde_json::json!({ "status": false, "error": error.to_string() })),
     }
 }
 
+/// SABnzbd's `get_cats` reports the default category as the literal
+/// sentinel `"*"`, not a display name -- verified against
+/// `sabnzbd/sabnzbd@5.1.x`, `sabnzbd/api.py::list_cats(default=False)`.
+/// RustNZB's own category model still names that category "Default"
+/// internally, so translate at the API boundary in both directions.
+const SAB_DEFAULT_CATEGORY_SENTINEL: &str = "*";
+
 fn handle_get_cats(state: &AppState) -> Json<serde_json::Value> {
     let config = state.config();
-    let mut cats: Vec<String> = config.categories.iter().map(|c| c.name.clone()).collect();
-    if !cats.iter().any(|c| c == "Default") {
-        cats.insert(0, "Default".into());
+    let mut cats: Vec<String> = config
+        .categories
+        .iter()
+        .map(|c| {
+            if c.name.eq_ignore_ascii_case("Default") {
+                SAB_DEFAULT_CATEGORY_SENTINEL.to_string()
+            } else {
+                c.name.clone()
+            }
+        })
+        .collect();
+    if !cats.iter().any(|c| c == SAB_DEFAULT_CATEGORY_SENTINEL) {
+        cats.insert(0, SAB_DEFAULT_CATEGORY_SENTINEL.into());
     }
     Json(serde_json::json!({ "categories": cats }))
 }
 
+/// Translate a client-supplied category into RustNZB's internal name,
+/// resolving SABnzbd's `"*"` default-category sentinel.
+fn sab_resolve_category(cat: &str) -> &str {
+    if cat == SAB_DEFAULT_CATEGORY_SENTINEL {
+        "Default"
+    } else {
+        cat
+    }
+}
+
+/// `value` may be a comma-separated list of nzo_ids, matching SABnzbd's
+/// `_api_change_cat` (`nzo_ids = clean_comma_separated_list(kwargs.get("value"))`).
 fn handle_change_cat(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
-    let job_id = req.value.as_deref().unwrap_or("");
+    let job_ids = req.value.as_deref().unwrap_or("");
     let new_cat = req.value2.as_deref().unwrap_or("");
 
-    if job_id.is_empty() || new_cat.is_empty() {
+    if job_ids.is_empty() || new_cat.is_empty() {
         return Json(serde_json::json!({
             "status": false,
             "error": "Missing value (job id) or value2 (category)"
         }));
     }
 
-    let search_id = job_id.strip_prefix("SABnzbd_nzo_").unwrap_or(job_id);
-
     let qm = &state.queue_manager;
-    match qm.change_job_category(search_id, new_cat) {
-        Ok(()) => Json(serde_json::json!({ "status": true })),
-        Err(e) => Json(serde_json::json!({
-            "status": false,
-            "error": format!("{e}")
-        })),
+    let resolved_cat = sab_resolve_category(new_cat);
+    let mut changed = false;
+    for raw_id in job_ids
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+        if qm.change_job_category(search_id, resolved_cat).is_ok() {
+            changed = true;
+        }
     }
+
+    Json(serde_json::json!({ "status": changed }))
 }
 
 fn handle_rename(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
@@ -1230,10 +1405,13 @@ fn handle_rename(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
 /// Convert arr-protocol priority string to our Priority enum.
 fn sab_priority_to_priority(s: &str) -> Priority {
     match s.trim() {
-        "-100" | "3" => Priority::Force,
-        "2" => Priority::High,
-        "1" => Priority::Normal,
-        "0" => Priority::Low,
+        "-1" => Priority::Low,
+        "0" | "-100" => Priority::Normal,
+        "1" => Priority::High,
+        // SABnzbd's Force (2) and Repair (3) priorities both mean "jump the
+        // queue"; RustNZB has no separate Repair concept, so both map to
+        // our highest priority.
+        "2" | "3" => Priority::Force,
         _ => Priority::Normal,
     }
 }
@@ -2147,5 +2325,394 @@ mod tests {
                 .unwrap_or_else(|error| panic!("read {name}: {error}"));
             sab_contract::golden(&contents);
         }
+    }
+
+    /// Numeric priority codes per SABnzbd 5.1.x `sabnzbd/constants.py`:
+    /// FORCE_PRIORITY=2, HIGH_PRIORITY=1, NORMAL_PRIORITY=0, LOW_PRIORITY=-1,
+    /// DEFAULT_PRIORITY=-100 (displayed/treated as Normal), REPAIR_PRIORITY=3.
+    #[test]
+    fn sab_priority_to_priority_matches_upstream_numeric_codes() {
+        assert_eq!(sab_priority_to_priority("-1"), Priority::Low);
+        assert_eq!(sab_priority_to_priority("0"), Priority::Normal);
+        assert_eq!(sab_priority_to_priority("1"), Priority::High);
+        assert_eq!(sab_priority_to_priority("2"), Priority::Force);
+        assert_eq!(sab_priority_to_priority("3"), Priority::Force);
+        assert_eq!(sab_priority_to_priority("-100"), Priority::Normal);
+    }
+
+    /// The numeric codes accepted when *setting* a priority must agree with
+    /// the codes `sab_priority_matches` uses when *filtering* the queue by
+    /// priority -- a prior regression let these two tables diverge silently.
+    #[test]
+    fn sab_priority_to_priority_agrees_with_sab_priority_matches() {
+        for (priority, numeric) in [
+            (Priority::Low, "-1"),
+            (Priority::Normal, "0"),
+            (Priority::High, "1"),
+            (Priority::Force, "2"),
+        ] {
+            assert_eq!(sab_priority_to_priority(numeric), priority);
+            assert!(sab_priority_matches(priority, numeric));
+        }
+    }
+
+    fn add_live_job(test_state: &TestState, id: &str) {
+        let job = NzbJob {
+            id: id.into(),
+            name: "Compat Layer Fixture".into(),
+            category: "tv".into(),
+            status: JobStatus::Queued,
+            priority: Priority::Normal,
+            total_bytes: 1_048_576,
+            downloaded_bytes: 0,
+            file_count: 1,
+            files_completed: 0,
+            article_count: 1,
+            articles_downloaded: 0,
+            articles_failed: 0,
+            added_at: chrono::Utc::now(),
+            completed_at: None,
+            work_dir: test_state.state.config().general.incomplete_dir.join(id),
+            output_dir: test_state.state.config().general.complete_dir.join(id),
+            password: None,
+            error_message: None,
+            speed_bps: 0,
+            server_stats: Vec::new(),
+            files: Vec::new(),
+        };
+        test_state
+            .state
+            .queue_manager
+            .add_job(job, None)
+            .expect("add live queue fixture");
+    }
+
+    fn add_live_job_with_category(test_state: &TestState, id: &str, category: &str) {
+        let job = NzbJob {
+            id: id.into(),
+            name: "Change Cat Fixture".into(),
+            category: category.into(),
+            status: JobStatus::Queued,
+            priority: Priority::Normal,
+            total_bytes: 1_048_576,
+            downloaded_bytes: 0,
+            file_count: 1,
+            files_completed: 0,
+            article_count: 1,
+            articles_downloaded: 0,
+            articles_failed: 0,
+            added_at: chrono::Utc::now(),
+            completed_at: None,
+            work_dir: test_state.state.config().general.incomplete_dir.join(id),
+            output_dir: test_state.state.config().general.complete_dir.join(id),
+            password: None,
+            error_message: None,
+            speed_bps: 0,
+            server_stats: Vec::new(),
+            files: Vec::new(),
+        };
+        test_state
+            .state
+            .queue_manager
+            .add_job(job, None)
+            .expect("add live queue fixture");
+    }
+
+    /// SABnzbd's real priority endpoint is `mode=queue&name=priority`, not
+    /// the top-level `mode=priority` this compat layer also accepts.
+    #[tokio::test]
+    async fn queue_priority_subcommand_changes_job_priority() {
+        let test_state = test_state();
+        add_live_job(&test_state, "queue-priority-job");
+
+        let req = SabApiRequest {
+            mode: Some("queue".into()),
+            name: Some("priority".into()),
+            value: Some("queue-priority-job".into()),
+            value2: Some("1".into()),
+            ..SabApiRequest::default()
+        };
+        let response = dispatch_mode(&test_state.state, "queue", &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+
+        let job = test_state
+            .state
+            .queue_manager
+            .get_jobs()
+            .into_iter()
+            .find(|job| job.id == "queue-priority-job")
+            .expect("job still queued");
+        // This test covers routing (does mode=queue&name=priority reach the
+        // queue manager at all?), not the value mapping itself -- that's
+        // covered separately by sab_priority_to_priority's own tests.
+        assert_eq!(job.priority, sab_priority_to_priority("1"));
+    }
+
+    /// SABnzbd's real rename endpoint is `mode=queue&name=rename`.
+    #[tokio::test]
+    async fn queue_rename_subcommand_renames_job() {
+        let test_state = test_state();
+        add_live_job(&test_state, "queue-rename-job");
+
+        let req = SabApiRequest {
+            mode: Some("queue".into()),
+            name: Some("rename".into()),
+            value: Some("queue-rename-job".into()),
+            value2: Some("New Name".into()),
+            ..SabApiRequest::default()
+        };
+        let response = dispatch_mode(&test_state.state, "queue", &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+
+        let job = test_state
+            .state
+            .queue_manager
+            .get_jobs()
+            .into_iter()
+            .find(|job| job.id == "queue-rename-job")
+            .expect("job still queued");
+        assert_eq!(job.name, "New Name");
+    }
+
+    /// SABnzbd's real `get_cats` reports the default category as `"*"`, not
+    /// a display name -- verified against `sabnzbd/api.py::list_cats(default=False)`.
+    #[tokio::test]
+    async fn get_cats_reports_default_category_as_sabnzbd_sentinel() {
+        let test_state = test_state();
+        let response = handle_get_cats(&test_state.state).0;
+        let cats = response["categories"].as_array().expect("categories array");
+        assert_eq!(cats, &vec![serde_json::json!("*")]);
+    }
+
+    #[tokio::test]
+    async fn change_cat_accepts_sabnzbd_default_sentinel() {
+        let test_state = test_state();
+        add_live_job(&test_state, "sentinel-cat-job");
+        test_state
+            .state
+            .queue_manager
+            .change_job_category("sentinel-cat-job", "movies")
+            .expect("seed non-default category");
+
+        let req = SabApiRequest {
+            value: Some("sentinel-cat-job".into()),
+            value2: Some("*".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_change_cat(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+
+        let job = test_state
+            .state
+            .queue_manager
+            .get_jobs()
+            .into_iter()
+            .find(|job| job.id == "sentinel-cat-job")
+            .expect("job still queued");
+        assert_eq!(job.category, "Default");
+    }
+
+    /// SABnzbd's real `_api_change_cat` accepts a comma-separated `value`
+    /// list, applying the category change to every matching job.
+    #[tokio::test]
+    async fn change_cat_applies_to_multiple_comma_separated_ids() {
+        let test_state = test_state();
+        add_live_job_with_category(&test_state, "multi-cat-one", "tv");
+        add_live_job_with_category(&test_state, "multi-cat-two", "tv");
+
+        let req = SabApiRequest {
+            value: Some("multi-cat-one,multi-cat-two".into()),
+            value2: Some("movies".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_change_cat(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+
+        let jobs = test_state.state.queue_manager.get_jobs();
+        for id in ["multi-cat-one", "multi-cat-two"] {
+            let job = jobs
+                .iter()
+                .find(|job| job.id == id)
+                .unwrap_or_else(|| panic!("job {id} still queued"));
+            assert_eq!(job.category, "movies");
+        }
+    }
+
+    /// Real SABnzbd's `mode=get_scripts` always answers with at least
+    /// `["None"]` (sabnzbd/api.py::_api_get_scripts,
+    /// filesystem.py::list_scripts) -- clients that fetch categories and
+    /// scripts together to populate an "add download" dialog may fail to
+    /// populate the whole dialog if this call errors, as it previously did.
+    #[tokio::test]
+    async fn get_scripts_reports_none_when_unsupported() {
+        let test_state = test_state();
+        let req = SabApiRequest::default();
+        let response = dispatch_mode(&test_state.state, "get_scripts", &req).0;
+        assert_eq!(response["scripts"], serde_json::json!(["None"]));
+    }
+
+    /// SABnzbd's real `_api_queue_delete` accepts a comma-separated `value`
+    /// list, removing every matching job in one call.
+    #[tokio::test]
+    async fn queue_delete_removes_multiple_comma_separated_ids() {
+        let test_state = test_state();
+        add_live_job(&test_state, "multi-delete-one");
+        add_live_job(&test_state, "multi-delete-two");
+
+        let req = SabApiRequest {
+            value: Some("multi-delete-one,multi-delete-two".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_queue_delete(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+
+        let remaining = test_state.state.queue_manager.get_jobs();
+        assert!(
+            remaining
+                .iter()
+                .all(|job| job.id != "multi-delete-one" && job.id != "multi-delete-two")
+        );
+    }
+
+    fn insert_history_fixture(test_state: &TestState, id: &str, output_dir: std::path::PathBuf) {
+        let entry = HistoryEntry {
+            id: id.into(),
+            name: id.into(),
+            category: "tv".into(),
+            status: JobStatus::Completed,
+            total_bytes: 10_000,
+            downloaded_bytes: 10_000,
+            added_at: chrono::Utc::now() - chrono::Duration::seconds(20),
+            completed_at: chrono::Utc::now(),
+            download_time_secs: Some(1.0),
+            output_dir,
+            stages: Vec::new(),
+            error_message: None,
+            server_stats: Vec::new(),
+            nzb_data: None,
+        };
+        test_state.state.queue_manager.with_db(|database| {
+            database
+                .history_insert(&entry)
+                .expect("insert history fixture")
+        });
+    }
+
+    /// Real SABnzbd's `_api_history_delete` removes the completed output
+    /// directory from disk when `del_files=1` is set; RustNZB previously
+    /// never freed that space regardless of the flag.
+    #[tokio::test]
+    async fn history_delete_with_del_files_removes_output_directory() {
+        let test_state = test_state();
+        let output_dir = test_state
+            .state
+            .config()
+            .general
+            .complete_dir
+            .join("del-files-job");
+        std::fs::create_dir_all(&output_dir).expect("create fixture output dir");
+        std::fs::write(output_dir.join("file.mkv"), b"data").expect("write fixture file");
+        insert_history_fixture(&test_state, "del-files-job", output_dir.clone());
+
+        let req = SabApiRequest {
+            value: Some("del-files-job".into()),
+            del_files: Some("1".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_history_delete(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert!(!output_dir.exists());
+    }
+
+    /// Without `del_files`, history delete only removes the DB record, as
+    /// before.
+    #[tokio::test]
+    async fn history_delete_without_del_files_keeps_output_directory() {
+        let test_state = test_state();
+        let output_dir = test_state
+            .state
+            .config()
+            .general
+            .complete_dir
+            .join("keep-files-job");
+        std::fs::create_dir_all(&output_dir).expect("create fixture output dir");
+        insert_history_fixture(&test_state, "keep-files-job", output_dir.clone());
+
+        let req = SabApiRequest {
+            value: Some("keep-files-job".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_history_delete(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert!(output_dir.exists());
+    }
+
+    const SAMPLE_NZB: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="test@example.com" date="1234567890" subject="test.rar (1/2)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment number="1" bytes="768000">article1@example.com</segment>
+      <segment number="2" bytes="768000">article2@example.com</segment>
+    </segments>
+  </file>
+</nzb>"#;
+
+    /// Serves `body` once over a raw TCP listener bound to an ephemeral
+    /// port, returning the URL to fetch it from.
+    async fn spawn_nzb_server(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral test server");
+        let addr = listener.local_addr().expect("test server local addr");
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept test connection");
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/x-nzb\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+
+        format!("http://{addr}/test.nzb")
+    }
+
+    /// NZB360 (and real SABnzbd) add downloads found via search as a plain
+    /// GET `mode=addurl` request, since there's no file body to upload --
+    /// only the POST/multipart path handled `cat` for that mode, so GET
+    /// requests silently dropped the requested category.
+    #[tokio::test]
+    async fn addurl_over_get_applies_requested_category() {
+        let test_state = test_state();
+        let url = spawn_nzb_server(SAMPLE_NZB).await;
+
+        let req = SabApiRequest {
+            mode: Some("addurl".into()),
+            name: Some(url),
+            cat: Some("movies".into()),
+            apikey: Some("contract-api-key".into()),
+            ..SabApiRequest::default()
+        };
+
+        let response = h_sabnzbd_api_get(State(Arc::new(test_state.state)), Query(req))
+            .await
+            .expect("addurl over GET should succeed")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("parse JSON body");
+
+        assert_eq!(value["status"], serde_json::json!(true));
+        assert!(value["nzo_ids"][0].as_str().is_some());
     }
 }

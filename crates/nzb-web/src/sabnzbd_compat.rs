@@ -1365,7 +1365,11 @@ fn handle_change_cat(state: &AppState, req: &SabApiRequest) -> Json<serde_json::
     let qm = &state.queue_manager;
     let resolved_cat = sab_resolve_category(new_cat);
     let mut changed = false;
-    for raw_id in job_ids.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+    for raw_id in job_ids
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
         let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
         if qm.change_job_category(search_id, resolved_cat).is_ok() {
             changed = true;
@@ -2476,9 +2480,7 @@ mod tests {
     async fn get_cats_reports_default_category_as_sabnzbd_sentinel() {
         let test_state = test_state();
         let response = handle_get_cats(&test_state.state).0;
-        let cats = response["categories"]
-            .as_array()
-            .expect("categories array");
+        let cats = response["categories"].as_array().expect("categories array");
         assert_eq!(cats, &vec![serde_json::json!("*")]);
     }
 

@@ -73,8 +73,130 @@ pub async fn h_sabnzbd_api_get(
     }
 
     let mode = req.mode.as_deref().unwrap_or("");
+
+    // `addurl` fetches a remote NZB and has no file body to upload, so real
+    // SABnzbd (and clients like NZB360/Sonarr/Radarr) issue it as a plain
+    // GET rather than a multipart POST. Route it to the same URL-fetching
+    // logic the POST handler uses so `cat`/`priority` are honored here too.
+    if mode == "addurl" {
+        let url = req.name.clone().or_else(|| req.value.clone());
+        return handle_addurl(
+            &state,
+            url,
+            req.name.clone(),
+            req.cat.clone(),
+            req.priority.clone(),
+            req.password.clone(),
+        )
+        .await;
+    }
+
     let result = dispatch_mode(&state, mode, &req);
     Ok(result)
+}
+
+/// Fetch an NZB from a URL and enqueue it, applying category/priority/password
+/// overrides. Shared by the GET and POST `addurl` entry points.
+async fn handle_addurl(
+    state: &AppState,
+    url: Option<String>,
+    name: Option<String>,
+    cat: Option<String>,
+    priority: Option<String>,
+    password: Option<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let url = url.unwrap_or_default();
+
+    if url.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "status": false,
+            "error": "No URL provided"
+        })));
+    }
+
+    tracing::info!(url = %url, "Fetching NZB from URL via arr API");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| ApiError::from(anyhow::anyhow!("HTTP client error: {e}")))?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to fetch URL: {e}")))?;
+
+    if !response.status().is_success() {
+        return Ok(Json(serde_json::json!({
+            "status": false,
+            "error": format!("URL returned HTTP {}", response.status())
+        })));
+    }
+
+    let data = response
+        .bytes()
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to read response: {e}")))?;
+
+    // Derive job name from URL filename if not provided
+    let job_name = name.unwrap_or_else(|| {
+        url.rsplit('/')
+            .next()
+            .and_then(|s| s.split('?').next())
+            .unwrap_or("unknown")
+            .strip_suffix(".nzb")
+            .unwrap_or(
+                url.rsplit('/')
+                    .next()
+                    .and_then(|s| s.split('?').next())
+                    .unwrap_or("unknown"),
+            )
+            .to_string()
+    });
+
+    match nzb_parser::parse_nzb(&job_name, &data) {
+        Ok(mut job) => {
+            if let Some(ref c) = cat
+                && !c.is_empty()
+            {
+                job.category = c.clone();
+            }
+            if let Some(ref p) = priority {
+                job.priority = sab_priority_to_priority(p);
+            }
+
+            // API-provided password overrides NZB metadata password
+            if let Some(ref pw) = password {
+                job.password = Some(pw.clone());
+            }
+
+            let qm = &state.queue_manager;
+            job.work_dir = qm.incomplete_dir().join(&job.id);
+            job.output_dir = qm.complete_dir().join(&job.category).join(&job.name);
+
+            let nzo_id = format!("SABnzbd_nzo_{}", &job.id[..12.min(job.id.len())]);
+
+            tracing::info!(
+                name = %job.name,
+                id = %job.id,
+                files = job.file_count,
+                "NZB added to queue via URL (arr API)"
+            );
+
+            let nzb_bytes = data.to_vec();
+            qm.add_job(job, Some(nzb_bytes)).map_err(ApiError::from)?;
+
+            Ok(Json(serde_json::json!({
+                "status": true,
+                "nzo_ids": [nzo_id]
+            })))
+        }
+        Err(e) => Ok(Json(serde_json::json!({
+            "status": false,
+            "error": format!("Failed to parse NZB: {e}")
+        }))),
+    }
 }
 
 /// POST /sabnzbd/api -- Handle POST requests (addfile multipart, or form-encoded).
@@ -238,99 +360,8 @@ pub async fn h_sabnzbd_api_post(
         }
 
         "addurl" => {
-            let url = nzb_url.or(name.clone()).unwrap_or_default();
-
-            if url.is_empty() {
-                return Ok(Json(serde_json::json!({
-                    "status": false,
-                    "error": "No URL provided"
-                })));
-            }
-
-            tracing::info!(url = %url, "Fetching NZB from URL via arr API");
-
-            // Fetch the NZB from the URL
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .map_err(|e| ApiError::from(anyhow::anyhow!("HTTP client error: {e}")))?;
-
-            let response = client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to fetch URL: {e}")))?;
-
-            if !response.status().is_success() {
-                return Ok(Json(serde_json::json!({
-                    "status": false,
-                    "error": format!("URL returned HTTP {}", response.status())
-                })));
-            }
-
-            let data = response
-                .bytes()
-                .await
-                .map_err(|e| ApiError::from(anyhow::anyhow!("Failed to read response: {e}")))?;
-
-            // Derive job name from URL filename if not provided
-            let job_name = name.clone().unwrap_or_else(|| {
-                url.rsplit('/')
-                    .next()
-                    .and_then(|s| s.split('?').next())
-                    .unwrap_or("unknown")
-                    .strip_suffix(".nzb")
-                    .unwrap_or(
-                        url.rsplit('/')
-                            .next()
-                            .and_then(|s| s.split('?').next())
-                            .unwrap_or("unknown"),
-                    )
-                    .to_string()
-            });
-
-            match nzb_parser::parse_nzb(&job_name, &data) {
-                Ok(mut job) => {
-                    if let Some(ref c) = cat
-                        && !c.is_empty()
-                    {
-                        job.category = c.clone();
-                    }
-                    if let Some(ref p) = priority {
-                        job.priority = sab_priority_to_priority(p);
-                    }
-
-                    // API-provided password overrides NZB metadata password
-                    if let Some(ref pw) = password {
-                        job.password = Some(pw.clone());
-                    }
-
-                    let qm = &state.queue_manager;
-                    job.work_dir = qm.incomplete_dir().join(&job.id);
-                    job.output_dir = qm.complete_dir().join(&job.category).join(&job.name);
-
-                    let nzo_id = format!("SABnzbd_nzo_{}", &job.id[..12.min(job.id.len())]);
-
-                    tracing::info!(
-                        name = %job.name,
-                        id = %job.id,
-                        files = job.file_count,
-                        "NZB added to queue via URL (arr API)"
-                    );
-
-                    let nzb_bytes = data.to_vec();
-                    qm.add_job(job, Some(nzb_bytes)).map_err(ApiError::from)?;
-
-                    Ok(Json(serde_json::json!({
-                        "status": true,
-                        "nzo_ids": [nzo_id]
-                    })))
-                }
-                Err(e) => Ok(Json(serde_json::json!({
-                    "status": false,
-                    "error": format!("Failed to parse NZB: {e}")
-                }))),
-            }
+            let url = nzb_url.or_else(|| name.clone());
+            handle_addurl(&state, url, name, cat, priority, password).await
         }
 
         _ => {
@@ -2179,5 +2210,74 @@ mod tests {
             assert_eq!(sab_priority_to_priority(numeric), priority);
             assert!(sab_priority_matches(priority, numeric));
         }
+    }
+
+    const SAMPLE_NZB: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="test@example.com" date="1234567890" subject="test.rar (1/2)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment number="1" bytes="768000">article1@example.com</segment>
+      <segment number="2" bytes="768000">article2@example.com</segment>
+    </segments>
+  </file>
+</nzb>"#;
+
+    /// Serves `body` once over a raw TCP listener bound to an ephemeral
+    /// port, returning the URL to fetch it from.
+    async fn spawn_nzb_server(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral test server");
+        let addr = listener.local_addr().expect("test server local addr");
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept test connection");
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/x-nzb\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+
+        format!("http://{addr}/test.nzb")
+    }
+
+    /// NZB360 (and real SABnzbd) add downloads found via search as a plain
+    /// GET `mode=addurl` request, since there's no file body to upload --
+    /// only the POST/multipart path handled `cat` for that mode, so GET
+    /// requests silently dropped the requested category.
+    #[tokio::test]
+    async fn addurl_over_get_applies_requested_category() {
+        let test_state = test_state();
+        let url = spawn_nzb_server(SAMPLE_NZB).await;
+
+        let req = SabApiRequest {
+            mode: Some("addurl".into()),
+            name: Some(url),
+            cat: Some("movies".into()),
+            apikey: Some("contract-api-key".into()),
+            ..SabApiRequest::default()
+        };
+
+        let response = h_sabnzbd_api_get(State(Arc::new(test_state.state)), Query(req))
+            .await
+            .expect("addurl over GET should succeed")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("parse JSON body");
+
+        assert_eq!(value["status"], serde_json::json!(true));
+        assert!(value["nzo_ids"][0].as_str().is_some());
     }
 }

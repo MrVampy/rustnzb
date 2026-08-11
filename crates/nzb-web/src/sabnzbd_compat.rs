@@ -378,6 +378,12 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
 
         "get_cats" => handle_get_cats(state),
 
+        // RustNZB doesn't support post-processing scripts, so this is the
+        // permanent, correct response -- it matches what real SABnzbd
+        // reports when no script directory / scripts are configured
+        // (sabnzbd/api.py::_api_get_scripts -> filesystem.py::list_scripts).
+        "get_scripts" => Json(serde_json::json!({ "scripts": ["None"] })),
+
         "change_cat" => handle_change_cat(state, req),
 
         "rename" => handle_rename(state, req),
@@ -2396,5 +2402,18 @@ mod tests {
             .find(|job| job.id == "sentinel-cat-job")
             .expect("job still queued");
         assert_eq!(job.category, "Default");
+    }
+
+    /// Real SABnzbd's `mode=get_scripts` always answers with at least
+    /// `["None"]` (sabnzbd/api.py::_api_get_scripts,
+    /// filesystem.py::list_scripts) -- clients that fetch categories and
+    /// scripts together to populate an "add download" dialog may fail to
+    /// populate the whole dialog if this call errors, as it previously did.
+    #[tokio::test]
+    async fn get_scripts_reports_none_when_unsupported() {
+        let test_state = test_state();
+        let req = SabApiRequest::default();
+        let response = dispatch_mode(&test_state.state, "get_scripts", &req).0;
+        assert_eq!(response["scripts"], serde_json::json!(["None"]));
     }
 }

@@ -160,12 +160,34 @@ pub async fn run_pipeline_with_resources(
             });
         }
     } else if config.articles_failed == 0 {
+        // Files are known-good from CRC checks during yEnc decode, so the
+        // expensive MD5 verification pass is skipped.
+        //
+        // PAR2-guided deobfuscation still has to run. Obfuscated posts arrive
+        // with meaningless filenames whether or not an article failed, and the
+        // PAR2 metadata is the only record of the real names. While this
+        // rename lived inside the verify branch below, a *clean* download of
+        // an obfuscated post was never deobfuscated: no archive was found, the
+        // Extract stage reported "No archives found", and the job completed
+        // with raw volumes on disk. A damaged download self-healed; a healthy
+        // one did not (issue #87).
         info!("Skipping PAR2 verification — zero article failures (CRC-verified)");
+        let start = Instant::now();
+        let message = match rust_par2::parse(&par2_files[0]) {
+            Ok(file_set) => {
+                rename_to_par2_names(&file_set, job_dir);
+                "Skipped — zero article failures (PAR2-guided rename applied)".to_string()
+            }
+            Err(e) => {
+                debug!(error = %e, "PAR2 parse failed; skipping PAR2-guided deobfuscation");
+                format!("Skipped — zero article failures (PAR2 parse failed: {e})")
+            }
+        };
         stages.push(StageResult {
             name: "Verify".to_string(),
             status: StageStatus::Skipped,
-            message: Some("Skipped — zero article failures".to_string()),
-            duration_secs: 0.0,
+            message: Some(message),
+            duration_secs: start.elapsed().as_secs_f64(),
         });
     } else {
         let verify_start = Instant::now();
@@ -182,7 +204,9 @@ pub async fn run_pipeline_with_resources(
                 // PAR2 expected names (common with obfuscated posts where
                 // NZB subjects have readable names but PAR2 references
                 // the original obfuscated filenames), rename them using
-                // MD5-16k hash matching before verification runs.
+                // MD5-16k hash matching before verification runs. The
+                // zero-failure branch above runs this too — verification is
+                // skipped there, but deobfuscation must not be.
                 rename_to_par2_names(&file_set, job_dir);
 
                 // Run verify (and repair if needed) in a single spawn_blocking call.

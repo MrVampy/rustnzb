@@ -3,9 +3,57 @@
 //! Scans a completed download directory to find par2 files, RAR archives,
 //! 7z archives, ZIP archives, and cleanup candidates.
 
+use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
+
+/// RAR 4.x volume signature.
+const RAR4_SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
+/// RAR 5.x volume signature.
+const RAR5_SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";
+
+/// Returns true if the file begins with a RAR volume signature.
+///
+/// Obfuscated posts strip every naming cue, so content is the only reliable
+/// evidence that a `<hash>.NN` file is an archive volume. Extension matching
+/// alone would misclassify unrelated numeric-suffixed files.
+pub fn has_rar_signature(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    // Read up to the longest signature; short files simply cannot match.
+    let mut header = [0u8; RAR5_SIGNATURE.len()];
+    let mut filled = 0;
+    while filled < header.len() {
+        match file.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return false,
+        }
+    }
+    let head = &header[..filled];
+    head.starts_with(RAR4_SIGNATURE) || head.starts_with(RAR5_SIGNATURE)
+}
+
+/// Split a bare numeric extension: `"cfd4be79….45"` → `("cfd4be79…", 45)`.
+///
+/// Returns `None` for anything with a non-numeric extension, and for split 7z
+/// volumes (`archive.7z.001`) — those are numeric too, but they belong to the
+/// 7z path and must not be reclassified as RAR.
+fn split_numeric_volume(filename: &str) -> Option<(&str, u32)> {
+    let dot = filename.rfind('.')?;
+    let ext = &filename[dot + 1..];
+    if ext.is_empty() || !ext.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let stem = &filename[..dot];
+    if stem.to_ascii_lowercase().ends_with(".7z") {
+        return None;
+    }
+    ext.parse::<u32>().ok().map(|num| (stem, num))
+}
 
 /// Parsed RAR volume information: set name and volume number.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +123,32 @@ pub fn parse_rar_volume(filename: &str) -> Option<RarVolumeInfo> {
     }
 
     None
+}
+
+/// Parse a RAR volume from a file on disk, falling back to content inspection.
+///
+/// [`parse_rar_volume`] can only judge names, so it cannot recognise an
+/// obfuscated volume like `cfd4be79….45`. This variant additionally accepts a
+/// bare numeric extension when the file actually begins with a RAR signature —
+/// evidence a filename cannot provide. Prefer it wherever a path is available.
+///
+/// The volume number for an obfuscated set is the numeric extension itself, so
+/// volumes order correctly relative to one another within the set. It is not
+/// comparable with the numbering [`parse_rar_volume`] assigns to conventional
+/// sets, which is anchored to `.rar` = 0.
+pub fn parse_rar_volume_at(path: &Path) -> Option<RarVolumeInfo> {
+    let name = path.file_name().and_then(|n| n.to_str())?;
+    if let Some(info) = parse_rar_volume(name) {
+        return Some(info);
+    }
+    let (set_name, volume_number) = split_numeric_volume(name)?;
+    if !has_rar_signature(path) {
+        return None;
+    }
+    Some(RarVolumeInfo {
+        set_name: set_name.to_string(),
+        volume_number,
+    })
 }
 
 /// The type of archive detected.
@@ -159,6 +233,8 @@ fn is_par2_volume(name_lower: &str) -> bool {
 /// `unrar x`).
 pub fn find_rar_files(dir: &Path) -> Vec<PathBuf> {
     let mut first_volumes: Vec<PathBuf> = Vec::new();
+    // Obfuscated sets keyed by set name → (lowest volume seen, its path).
+    let mut numeric_sets: BTreeMap<String, (u32, PathBuf)> = BTreeMap::new();
 
     for entry in WalkDir::new(dir).into_iter().flatten() {
         let path = entry.path();
@@ -191,11 +267,34 @@ pub fn find_rar_files(dir: &Path) -> Vec<PathBuf> {
             }
             // Plain .rar with no .partNNN — this is the first volume in old-style
             first_volumes.push(path.to_path_buf());
+            continue;
         }
         // Old-style: .r00, .r01, etc. — we do NOT add these; the .rar file
         // is the first volume in old-style sets.
+        if parse_rar_volume(&name_lower).is_some() {
+            continue;
+        }
+
+        // Obfuscated set: `<name>.NN` with no recognisable extension. Only
+        // files that actually begin with a RAR signature qualify, so unrelated
+        // numeric-suffixed files (`Concert.Recording.1987`) are left alone.
+        // The lowest-numbered volume is treated as the one to hand to unrar.
+        if let Some((set_name, volume_number)) = split_numeric_volume(&name_lower)
+            && has_rar_signature(path)
+        {
+            numeric_sets
+                .entry(set_name.to_string())
+                .and_modify(|(lowest, lowest_path)| {
+                    if volume_number < *lowest {
+                        *lowest = volume_number;
+                        *lowest_path = path.to_path_buf();
+                    }
+                })
+                .or_insert_with(|| (volume_number, path.to_path_buf()));
+        }
     }
 
+    first_volumes.extend(numeric_sets.into_values().map(|(_, path)| path));
     first_volumes.sort();
     first_volumes
 }
@@ -251,7 +350,7 @@ pub fn find_cleanup_files(dir: &Path) -> Vec<PathBuf> {
             None => continue,
         };
 
-        if is_cleanup_candidate(&name) {
+        if is_cleanup_candidate_at(path, &name) {
             cleanup.push(path.to_path_buf());
         }
     }
@@ -273,7 +372,7 @@ pub fn has_usable_output(dir: &Path) -> std::io::Result<bool> {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !is_cleanup_candidate(&name.to_ascii_lowercase()) {
+        if !is_cleanup_candidate_at(path, &name.to_ascii_lowercase()) {
             return Ok(true);
         }
     }
@@ -307,8 +406,30 @@ fn is_split_7z_volume(name_lower: &str) -> bool {
     false
 }
 
-/// Determine whether a file (by its lowercased name) is safe to clean up
+/// Determine whether a file on disk is safe to clean up after successful
+/// extraction, using its name and — where the name is uninformative — its
+/// content.
+///
+/// `name_lower` must be the lowercased file name of `path`.
+///
+/// An obfuscated `<hash>.NN` volume is indistinguishable by name from an
+/// ordinary file that happens to end in digits, so the RAR signature is what
+/// separates junk to delete from payload to keep. Getting this wrong in either
+/// direction is costly: treating payload as junk deletes it, and treating an
+/// archive volume as payload lets a job report Completed with nothing usable
+/// in it (issue #87).
+fn is_cleanup_candidate_at(path: &Path, name_lower: &str) -> bool {
+    if is_cleanup_candidate(name_lower) {
+        return true;
+    }
+    split_numeric_volume(name_lower).is_some() && has_rar_signature(path)
+}
+
+/// Determine whether a file (by its lowercased name alone) is safe to clean up
 /// after successful extraction.
+///
+/// Name-only: prefer [`is_cleanup_candidate_at`] wherever a path is available,
+/// so obfuscated volumes are caught too.
 fn is_cleanup_candidate(name: &str) -> bool {
     // Par2 files: .par2
     if name.ends_with(".par2") || name.ends_with(".zip") || name.ends_with(".7z") {

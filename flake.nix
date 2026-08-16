@@ -2,9 +2,13 @@
   description = "rustnzb source package and exact Rust checks";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.rust-overlay = {
+    url = "github:oxalica/rust-overlay";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, rust-overlay }:
     let
       systems = [
         "x86_64-linux"
@@ -16,8 +20,21 @@
       packages = forEachSystem (
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
-          rustnzb = pkgs.rustPlatform.buildRustPackage {
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          };
+          toolchain = pkgs.rust-bin.stable."1.88.0".default.override {
+            extensions = [
+              "clippy"
+              "rustfmt"
+            ];
+          };
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = toolchain;
+            rustc = toolchain;
+          };
+          rustnzb = rustPlatform.buildRustPackage {
             pname = "rustnzb";
             version = "1.4.5";
             src = self;
@@ -66,7 +83,16 @@
       checks = forEachSystem (
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          };
+          toolchain = pkgs.rust-bin.stable."1.88.0".default.override {
+            extensions = [
+              "clippy"
+              "rustfmt"
+            ];
+          };
           rustnzb = self.packages.${system}.rustnzb;
           rustCommand =
             name: command:
@@ -74,10 +100,7 @@
               pname = "rustnzb-${name}";
               cargoBuildType = "debug";
               doCheck = false;
-              nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
-                pkgs.clippy
-                pkgs.rustfmt
-              ];
+              nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ toolchain ];
               buildPhase = ''
                 runHook preBuild
                 ${command}

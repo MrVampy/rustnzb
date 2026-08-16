@@ -29,7 +29,11 @@
             ];
             doCheck = false;
 
-            nativeBuildInputs = [ pkgs.makeWrapper ];
+            nativeBuildInputs = [
+              pkgs.makeWrapper
+              pkgs.pkg-config
+            ];
+            buildInputs = [ pkgs.openssl ];
             RUSTNZB_BUILD_REF = self.shortRev or "dirty";
             RUSTNZB_SKIP_FRONTEND_BUILD = "1";
 

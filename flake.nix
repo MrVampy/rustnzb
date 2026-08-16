@@ -66,10 +66,14 @@
           rustnzb = self.packages.${system}.rustnzb;
           rustCommand =
             name: command:
-            rustnzb.overrideAttrs (_: {
+            rustnzb.overrideAttrs (old: {
               pname = "rustnzb-${name}";
               cargoBuildType = "debug";
               doCheck = false;
+              nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
+                pkgs.clippy
+                pkgs.rustfmt
+              ];
               buildPhase = ''
                 runHook preBuild
                 ${command}

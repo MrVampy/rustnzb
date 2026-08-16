@@ -70,6 +70,7 @@ parking_lot = "0.12"
 arc-swap = "1"
 rand = "0.9"
 hex = "0.4"
+sha2 = "0.10"
 base64 = "0.22"
 governor = "0.10"
 webpki-roots = "0.26"
@@ -85,9 +86,9 @@ feed-rs = "2"
 unicode-normalization = "0.1"
 
 # Shared NZB crates
-nzb-web = { version = "0.4.20", path = "crates/nzb-web", features = ["groups-db"] }
+nzb-web = { version = "0.4.21", path = "crates/nzb-web", features = ["groups-db"] }
 nzb-nntp = { version = "0.2.22", path = "crates/nzb-nntp" }
-nzb-core = { version = "0.2.16", path = "crates/nzb-core", features = ["groups-db"] }
+nzb-core = { version = "0.2.17", path = "crates/nzb-core", features = ["groups-db"] }
 nzb-decode = { version = "0.1.2", path = "crates/nzb-decode" }
 nzb-news = { version = "0.1.12", path = "crates/nzb-news" }
 nzb-dispatch = { version = "0.2.6", path = "crates/nzb-dispatch" }

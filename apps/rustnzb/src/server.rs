@@ -17,8 +17,7 @@ use tracing::info;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::group_handlers;
-use crate::handlers;
+use crate::{admissions, group_handlers, group_observation, handlers};
 use nzb_web::auth;
 use nzb_web::error::ApiError;
 use nzb_web::sabnzbd_compat;
@@ -155,6 +154,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/queue", get(handlers::h_queue_list))
         .route("/queue/add", post(handlers::h_queue_add))
         .route("/queue/add-url", post(handlers::h_queue_add_url))
+        .route(
+            "/queue/admissions/{idempotency_key}",
+            get(admissions::h_queue_admission_get),
+        )
         .route("/queue/pause", post(handlers::h_queue_pause_all))
         .route("/queue/resume", post(handlers::h_queue_resume_all))
         .route("/queue/pause-for", post(handlers::h_queue_pause_for))
@@ -248,6 +251,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Newsgroup browsing
         .route("/groups", get(group_handlers::h_group_list))
         .route("/groups/refresh", post(group_handlers::h_group_refresh))
+        .route(
+            "/groups/overview-range",
+            post(group_observation::h_overview_range),
+        )
+        .route(
+            "/groups/header-pattern",
+            post(group_observation::h_header_pattern),
+        )
         .route("/groups/{id}", get(group_handlers::h_group_get))
         .route("/groups/{id}/status", get(group_handlers::h_group_status))
         .route(

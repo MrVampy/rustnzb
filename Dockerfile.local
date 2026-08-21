@@ -9,7 +9,7 @@
 #       --build-arg GIT_AUTH_TOKEN="$TOKEN" \
 #       -t rustnzb:local .
 #
-FROM rust:1.88-alpine3.21 AS builder
+FROM rust:1.97-alpine3.21@sha256:7bae7c67364dad5ebbd4060923b34d734fbed66d7c1cf3af72aa2f062af93eb6 AS builder
 
 RUN apk add --no-cache musl-dev build-base protoc openssl-dev openssl-libs-static curl nodejs npm git
 

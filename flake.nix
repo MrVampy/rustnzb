@@ -19,7 +19,7 @@
           pkgs = import nixpkgs { inherit system; };
           rustnzb = pkgs.rustPlatform.buildRustPackage {
             pname = "rustnzb";
-            version = "1.4.5";
+            version = "1.4.6";
             src = self;
 
             cargoLock.lockFile = ./Cargo.lock;

@@ -731,9 +731,7 @@ dependencies = [
 
 [[package]]
 name = "nzb-core"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ccfc1d1d8e3b5e2b95b0797e2f1540879b82d0e22a075eeb44c92b342a855eb"
+version = "0.2.18"
 dependencies = [
  "anyhow",
  "chrono",
@@ -778,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "nzb-postproc"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "nzb-core",

@@ -1867,6 +1867,7 @@ mod tests {
                 duration_secs: 3.6,
             }],
             error_message: (status == JobStatus::Failed).then(|| "broken archive".into()),
+            failure_code: (status == JobStatus::Failed).then_some(JobFailureCode::ArchiveInvalid),
             server_stats: Vec::new(),
             nzb_data: (status == JobStatus::Failed).then(Vec::new),
         }
@@ -2047,6 +2048,7 @@ mod tests {
             output_dir: "/downloads/complete".into(),
             stages: Vec::new(),
             error_message: None,
+            failure_code: None,
             server_stats: Vec::new(),
             nzb_data: None,
         };
@@ -2293,6 +2295,7 @@ mod tests {
                 .join("contract-history-job"),
             stages: Vec::new(),
             error_message: None,
+            failure_code: None,
             server_stats: Vec::new(),
             nzb_data: None,
         };
@@ -2588,6 +2591,7 @@ mod tests {
             output_dir,
             stages: Vec::new(),
             error_message: None,
+            failure_code: None,
             server_stats: Vec::new(),
             nzb_data: None,
         };

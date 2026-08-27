@@ -37,6 +37,46 @@ impl std::fmt::Display for JobStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobFailureCode {
+    ArticlesUnavailable,
+    RepairFailed,
+    ArchivePasswordRequired,
+    ArchiveInvalid,
+    StorageUnavailable,
+    DownloadFailed,
+}
+
+impl std::fmt::Display for JobFailureCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ArticlesUnavailable => write!(f, "articles_unavailable"),
+            Self::RepairFailed => write!(f, "repair_failed"),
+            Self::ArchivePasswordRequired => write!(f, "archive_password_required"),
+            Self::ArchiveInvalid => write!(f, "archive_invalid"),
+            Self::StorageUnavailable => write!(f, "storage_unavailable"),
+            Self::DownloadFailed => write!(f, "download_failed"),
+        }
+    }
+}
+
+impl std::str::FromStr for JobFailureCode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "articles_unavailable" => Ok(Self::ArticlesUnavailable),
+            "repair_failed" => Ok(Self::RepairFailed),
+            "archive_password_required" => Ok(Self::ArchivePasswordRequired),
+            "archive_invalid" => Ok(Self::ArchiveInvalid),
+            "storage_unavailable" => Ok(Self::StorageUnavailable),
+            "download_failed" => Ok(Self::DownloadFailed),
+            _ => Err(value.to_string()),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Priority
 // ---------------------------------------------------------------------------
@@ -199,6 +239,7 @@ pub struct HistoryEntry {
     /// Post-processing stages with results
     pub stages: Vec<StageResult>,
     pub error_message: Option<String>,
+    pub failure_code: Option<JobFailureCode>,
     /// Per-server download statistics
     #[serde(default)]
     pub server_stats: Vec<ServerArticleStats>,
@@ -251,6 +292,7 @@ pub enum QueueAdmissionState {
         completed_at: DateTime<Utc>,
         output_dir: PathBuf,
         error_message: Option<String>,
+        failure_code: Option<JobFailureCode>,
     },
     Unobserved,
 }
@@ -419,6 +461,21 @@ mod tests {
         assert_eq!(JobStatus::PostProcessing.to_string(), "PostProcessing");
         assert_eq!(JobStatus::Completed.to_string(), "Completed");
         assert_eq!(JobStatus::Failed.to_string(), "Failed");
+    }
+
+    #[test]
+    fn terminal_failure_codes_have_stable_wire_values() {
+        let code = JobFailureCode::ArchivePasswordRequired;
+        assert_eq!(code.to_string(), "archive_password_required");
+        assert_eq!(
+            serde_json::to_string(&code).unwrap(),
+            "\"archive_password_required\""
+        );
+        assert_eq!(
+            "archive_password_required".parse(),
+            Ok(JobFailureCode::ArchivePasswordRequired)
+        );
+        assert!("private extractor prose".parse::<JobFailureCode>().is_err());
     }
 
     #[test]

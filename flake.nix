@@ -11,15 +11,18 @@
         "aarch64-linux"
       ];
       forEachSystem = nixpkgs.lib.genAttrs systems;
+      mkPkgs =
+        system:
+        import nixpkgs {
+          inherit system;
+          config.allowUnfreePredicate = package: nixpkgs.lib.getName package == "unrar";
+        };
     in
     {
       packages = forEachSystem (
         system:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            config.allowUnfreePredicate = package: nixpkgs.lib.getName package == "unrar";
-          };
+          pkgs = mkPkgs system;
           rustnzb = pkgs.rustPlatform.buildRustPackage {
             pname = "rustnzb";
             version = "1.4.6";
@@ -70,7 +73,7 @@
       checks = forEachSystem (
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = mkPkgs system;
           rustnzb = self.packages.${system}.rustnzb;
           rustCommand =
             name: command:

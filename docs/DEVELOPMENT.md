@@ -5,7 +5,7 @@
 - Rust 1.97.1
 - Node.js 22 for the Angular frontend
 - Docker and Docker Buildx for container and browser-task workflows
-- `7z` for archive extraction at runtime
+- `unrar` for RAR extraction and `7z` for 7z extraction at runtime
 
 ## Core checks
 

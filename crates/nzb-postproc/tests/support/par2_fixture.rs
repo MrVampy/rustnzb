@@ -66,6 +66,11 @@ impl Par2Fixture {
         }
     }
 
+    pub fn with_recovery_set_id(mut self, recovery_set_id: [u8; 16]) -> Self {
+        self.recovery_set_id = recovery_set_id;
+        self
+    }
+
     /// Record `contents` under the canonical name PAR2 should report.
     ///
     /// This does not write the file to disk — the test decides whether to

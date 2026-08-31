@@ -22,7 +22,10 @@ pub fn assert_matches_golden(mut actual: Value, expected: &Value) {
 }
 
 fn normalize_at(actual: &mut Value, expected: &Value, path: &str) {
-    if let Some(marker) = expected.as_str().filter(|value| value.starts_with("$type:")) {
+    if let Some(marker) = expected
+        .as_str()
+        .filter(|value| value.starts_with("$type:"))
+    {
         assert_marker(actual, marker, path);
         *actual = expected.clone();
         return;

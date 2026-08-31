@@ -189,10 +189,12 @@ The trailing `d` is a local directory artefact and is deliberately not carried
 into Vogt. `rustnzbd` is also a GHCR/Forgejo image name; no repository by that
 name exists.
 
-**Canonical remote.** `https://github.com/TheDancingDeveloper-org/rustnzb`.
-The older `AusAgentSmith-org/rustnzb` URL still resolves, because GitHub follows
-transfer redirects and returns `200` — it is a redirect, not a home. Both `origin`
-and `destination` in this checkout already point at the canonical owner.
+**Canonical writable remote.** `origin` is the private mesh repository at
+`ssh://git@git.mesh:2222/MrVampy/rustnzb.git`. Ordinary source work is pushed
+once to a non-default branch there and enters the Dependencies proposal flow.
+`https://github.com/TheDancingDeveloper-org/rustnzb` is the read-only upstream
+reference for this fork; do not publish or open a pull request there unless the
+operator explicitly requests an upstream contribution.
 
 **Other copies.** This working tree is the one people develop in, which is why
 the project was `register`ed rather than `import`ed — `project import` would have

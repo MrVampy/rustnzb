@@ -17,12 +17,6 @@ use tokio::task::JoinHandle;
 
 const YENC_LINE_WIDTH: usize = 128;
 
-fn workspace_path(path: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(path)
-}
-
 pub struct TestApp {
     pub base_url: String,
     pub complete_dir: PathBuf,
@@ -111,7 +105,7 @@ pub async fn start_test_server(server_configs: Vec<ServerConfig>) -> TestApp {
 }
 
 pub fn sample_nzb_bytes() -> Vec<u8> {
-    std::fs::read(workspace_path("e2e/fixtures/sample.nzb"))
+    std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.nzb"))
         .expect("Failed to read sample NZB fixture")
 }
 

@@ -2,11 +2,9 @@ use nzb_web::nzb_core::sabnzbd_import::*;
 
 fn sab_benchmark_ini() -> String {
     std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("benchnzb/configs/sabnzbd.ini"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sabnzbd.ini"),
     )
-    .expect("benchnzb/configs/sabnzbd.ini should exist")
+    .expect("tests/fixtures/sabnzbd.ini should exist")
 }
 
 // ---------------------------------------------------------------------------

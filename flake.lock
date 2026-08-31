@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "cargo-nix-plugin": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1788188194,
+        "narHash": "sha256-uKyeg5+5ym3MEkQCm1IW53Cb1Sm8oiprx6XUn5kV8IE=",
+        "ref": "main",
+        "rev": "4e4c8cc58686569fdc0f3f4b87f0c667aeb623f1",
+        "revCount": 126,
+        "type": "git",
+        "url": "ssh://git@git.mesh:2222/MrVampy/cargo-nix-plugin.git"
+      },
+      "original": {
+        "ref": "main",
+        "type": "git",
+        "url": "ssh://git@git.mesh:2222/MrVampy/cargo-nix-plugin.git"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1788039129,
@@ -18,6 +35,7 @@
     },
     "root": {
       "inputs": {
+        "cargo-nix-plugin": "cargo-nix-plugin",
         "nixpkgs": "nixpkgs"
       }
     }

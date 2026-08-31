@@ -51,7 +51,7 @@ rm -rf state/sabnzbd state/rustnzb
 mkdir -p state/sabnzbd state/rustnzb
 
 # Seed config files
-cp configs/sabnzbd.ini state/sabnzbd/sabnzbd.ini
+cp ../apps/rustnzb/tests/fixtures/sabnzbd.ini state/sabnzbd/sabnzbd.ini
 cp configs/rustnzb.toml state/rustnzb/config.toml
 
 LOGFILE="results/run_$(date +%Y%m%d_%H%M%S).log"

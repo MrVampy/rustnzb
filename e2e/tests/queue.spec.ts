@@ -11,7 +11,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { readToken } from '../helpers/auth';
 
-const FIXTURES = path.resolve(__dirname, '../fixtures');
+const FIXTURES = path.resolve(__dirname, '../../apps/rustnzb/tests/fixtures');
 
 // ── 4.12 Seeded queue has 2 jobs ─────────────────────────────────────────────
 

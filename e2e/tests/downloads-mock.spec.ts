@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 import * as path from "path";
 
-const FIXTURES = path.resolve(__dirname, "../fixtures");
+const FIXTURES = path.resolve(__dirname, "../../apps/rustnzb/tests/fixtures");
 
 test.describe("Mock-backed downloads", () => {
   test("uploading the sample NZB completes and lands in history", async ({
